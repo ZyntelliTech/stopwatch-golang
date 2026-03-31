@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stopwatch Realtime Monitor</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+    }
+    .card {
+      width: min(760px, 92vw);
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      color: #93c5fd;
+    }
+    .status {
+      font-size: 14px;
+      color: #94a3b8;
+      margin-bottom: 16px;
+    }
+    .widgets {
+      margin-top: 16px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+    }
+    .widget {
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px;
+      background: #0b1220;
+    }
+    .widgetHead {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .widgetTitle {
+      font-size: 14px;
+      color: #cbd5e1;
+    }
+    .watch {
+      font-size: 34px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      margin: 10px 0 8px;
+      color: #22d3ee;
+    }
+    .meta {
+      font-size: 12px;
+      color: #94a3b8;
+      display: grid;
+      gap: 4px;
+    }
+    .actions {
+      margin-top: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    button {
+      background: #2563eb;
+      border: none;
+      color: white;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .mono {
+      font-family: Consolas, Monaco, monospace;
+    }
+    .widgetStatus {
+      font-size: 12px;
+      color: #94a3b8;
+      min-height: 16px;
+    }
+    .subtle {
+      color: #94a3b8;
+      font-size: 12px;
+    }
+    .manualAdd {
+      margin-top: 12px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .manualAdd input {
+      background: #0b1220;
+      border: 1px solid #334155;
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 10px 12px;
+      min-width: 240px;
+    }
+    .manualMsg {
+      font-size: 12px;
+      color: #94a3b8;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Stopwatch Realtime</h1>
+    <div id="status" class="status">Connecting...</div>
+    <div class="manualAdd">
+      <input id="manualDeviceId" class="mono" type="text" placeholder="Enter device_id (e.g. FAKE:01)" />
+      <button id="addWatchBtn">Add Watch</button>
+      <span id="manualAddMsg" class="manualMsg"></span>
+    </div>
+    <div class="subtle">A new widget is created automatically for each new device ID seen in the stream.</div>
+    <div id="widgets" class="widgets"></div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById("status");
+    const manualDeviceIdEl = document.getElementById("manualDeviceId");
+    const addWatchBtn = document.getElementById("addWatchBtn");
+    const manualAddMsgEl = document.getElementById("manualAddMsg");
+    const widgetsEl = document.getElementById("widgets");
+    const widgetsByDeviceId = new Map();
+
+    function formatStatus(status) {
+      const s = (status || "").trim().toLowerCase();
+      if (s === "start") return "Running";
+      if (s === "stop") return "Stopped";
+      if (s === "reset") return "Ready";
+      return "Unknown";
+    }
+
+    function createWidget(deviceId) {
+      const root = document.createElement("div");
+      root.className = "widget";
+
+      root.innerHTML = `
+        <div class="widgetHead">
+          <div class="widgetTitle">Device <span class="mono">${deviceId}</span></div>
+          <div class="widgetStatus" data-role="state">Waiting...</div>
+        </div>
+        <div class="watch mono" data-role="watch">00:00:00.00</div>
+        <div class="meta">
+          <div>Topic: <span class="mono" data-role="topic">-</span></div>
+          <div>Updated: <span class="mono" data-role="updated">-</span></div>
+        </div>
+        <div class="actions">
+          <button data-role="startBtn">Start</button>
+          <button data-role="stopBtn">Stop</button>
+          <button data-role="resetBtn">Reset</button>
+          <span class="widgetStatus" data-role="actionStatus"></span>
+        </div>
+      `;
+
+      const refs = {
+        root,
+        watchEl: root.querySelector('[data-role="watch"]'),
+        topicEl: root.querySelector('[data-role="topic"]'),
+        updatedEl: root.querySelector('[data-role="updated"]'),
+        stateEl: root.querySelector('[data-role="state"]'),
+        actionStatusEl: root.querySelector('[data-role="actionStatus"]'),
+        startBtn: root.querySelector('[data-role="startBtn"]'),
+        stopBtn: root.querySelector('[data-role="stopBtn"]'),
+        resetBtn: root.querySelector('[data-role="resetBtn"]'),
+      };
+
+      refs.startBtn.addEventListener("click", () => sendCommand(deviceId, "start", refs));
+      refs.stopBtn.addEventListener("click", () => sendCommand(deviceId, "stop", refs));
+      refs.resetBtn.addEventListener("click", () => sendCommand(deviceId, "reset", refs));
+
+      widgetsEl.appendChild(root);
+      widgetsByDeviceId.set(deviceId, refs);
+      return refs;
+    }
+
+    function getOrCreateWidget(deviceId) {
+      const existing = widgetsByDeviceId.get(deviceId);
+      if (existing) return existing;
+      return createWidget(deviceId);
+    }
+
+    function addWatchManually() {
+      const raw = manualDeviceIdEl.value || "";
+      const deviceId = raw.trim();
+      if (!deviceId) {
+        manualAddMsgEl.textContent = "Please enter a device_id";
+        return;
+      }
+      const existed = widgetsByDeviceId.has(deviceId);
+      getOrCreateWidget(deviceId);
+      if (existed) {
+        manualAddMsgEl.textContent = `Watch ${deviceId} already exists`;
+      } else {
+        manualAddMsgEl.textContent = `Watch ${deviceId} added`;
+      }
+      manualDeviceIdEl.value = "";
+      manualDeviceIdEl.focus();
+    }
+
+    function setWidgetButtonsDisabled(refs, disabled) {
+      refs.startBtn.disabled = disabled;
+      refs.stopBtn.disabled = disabled;
+      refs.resetBtn.disabled = disabled;
+    }
+
+    const stream = new EventSource("/api/mqtt/stream");
+
+    stream.addEventListener("ready", () => {
+      statusEl.textContent = "Connected. Waiting for stopwatch data...";
+    });
+
+    stream.addEventListener("stopwatch", (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        const deviceId = (msg.device_id || "").trim();
+        if (!deviceId) {
+          return;
+        }
+        const refs = getOrCreateWidget(deviceId);
+        refs.watchEl.textContent = msg.data || "00:00:00.00";
+        refs.topicEl.textContent = msg.topic || "-";
+        refs.stateEl.textContent = formatStatus(msg.status);
+
+        if (msg.received_at) {
+          const d = new Date(msg.received_at);
+          refs.updatedEl.textContent = d.toLocaleTimeString();
+        } else {
+          refs.updatedEl.textContent = "-";
+        }
+
+        statusEl.textContent = "Live stream connected";
+      } catch (err) {
+        statusEl.textContent = "Received malformed event payload";
+      }
+    });
+
+    stream.onerror = () => {
+      statusEl.textContent = "Disconnected. Retrying stream...";
+      for (const refs of widgetsByDeviceId.values()) {
+        setWidgetButtonsDisabled(refs, true);
+      }
+    };
+
+    async function sendCommand(deviceId, command, refs) {
+      const display = command.charAt(0).toUpperCase() + command.slice(1);
+      setWidgetButtonsDisabled(refs, true);
+      refs.actionStatusEl.textContent = `Sending ${display}...`;
+      try {
+        const res = await fetch(
+          `/api/mqtt/devices/${encodeURIComponent(deviceId)}/${command}`,
+          { method: "POST" }
+        );
+        if (!res.ok) {
+          const text = await res.text();
+          refs.actionStatusEl.textContent = `${display} failed: ${text || res.status}`;
+          return;
+        }
+        refs.actionStatusEl.textContent = `${display} sent`;
+      } catch (err) {
+        refs.actionStatusEl.textContent = `${display} failed: network error`;
+      } finally {
+        setWidgetButtonsDisabled(refs, false);
+      }
+    }
+
+    addWatchBtn.addEventListener("click", addWatchManually);
+    manualDeviceIdEl.addEventListener("keydown", (evt) => {
+      if (evt.key === "Enter") {
+        evt.preventDefault();
+        addWatchManually();
+      }
+    });
+  </script>
+</body>
+</html>

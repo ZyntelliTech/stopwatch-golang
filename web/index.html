@@ -15,7 +15,7 @@
       min-height: 100vh;
     }
     .card {
-      width: min(760px, 92vw);
+      width: min(960px, 96vw);
       background: #111827;
       border: 1px solid #334155;
       border-radius: 12px;
@@ -66,6 +66,34 @@
       color: #94a3b8;
       display: grid;
       gap: 4px;
+    }
+    .healthBlock {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid #1e293b;
+      font-size: 12px;
+      color: #94a3b8;
+      display: grid;
+      gap: 4px;
+    }
+    .healthBlock h3 {
+      margin: 0 0 4px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #a5b4fc;
+    }
+    .healthRaw {
+      margin: 6px 0 0;
+      padding: 8px;
+      background: #020617;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      font-size: 11px;
+      color: #cbd5e1;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 120px;
+      overflow: auto;
     }
     .actions {
       margin-top: 12px;
@@ -129,7 +157,7 @@
       <button id="addWatchBtn">Add Watch</button>
       <span id="manualAddMsg" class="manualMsg"></span>
     </div>
-    <div class="subtle">A new widget is created automatically for each new device ID seen in the stream.</div>
+    <div class="subtle">Widgets appear when a device sends stopwatch data or heartbeat on MQTT (e.g. <span class="mono">stopwatch/+/health</span>).</div>
     <div id="widgets" class="widgets"></div>
   </div>
 
@@ -149,19 +177,56 @@
       return "Unknown";
     }
 
+    /** Format milliseconds as HH:MM:SS.hh (hundredths of second), same as server. */
+    function formatMsToWatch(ms) {
+      let n = Number(ms);
+      if (!Number.isFinite(n) || n < 0) {
+        n = 0;
+      }
+      n = Math.floor(n);
+      const h = Math.floor(n / 3600000);
+      n %= 3600000;
+      const m = Math.floor(n / 60000);
+      n %= 60000;
+      const s = Math.floor(n / 1000);
+      let frac = Math.floor((n % 1000) / 10);
+      if (frac > 99) {
+        frac = 99;
+      }
+      const pad = (v, w) => String(v).padStart(w, "0");
+      return `${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)}.${pad(frac, 2)}`;
+    }
+
     function createWidget(deviceId) {
       const root = document.createElement("div");
       root.className = "widget";
 
       root.innerHTML = `
         <div class="widgetHead">
-          <div class="widgetTitle">Device <span class="mono">${deviceId}</span></div>
+          <div class="widgetTitle">Device <span class="mono" data-role="topicDeviceId">${deviceId}</span></div>
           <div class="widgetStatus" data-role="state">Waiting...</div>
         </div>
+        <div class="meta subtle" data-role="friendlyNameRow" style="display:none">Name: <span class="mono" data-role="friendlyName">-</span></div>
         <div class="watch mono" data-role="watch">00:00:00.00</div>
         <div class="meta">
-          <div>Topic: <span class="mono" data-role="topic">-</span></div>
-          <div>Updated: <span class="mono" data-role="updated">-</span></div>
+          <div>Data topic: <span class="mono" data-role="topic">-</span></div>
+          <div>Data updated: <span class="mono" data-role="updated">-</span></div>
+        </div>
+        <div class="healthBlock" data-role="timeBlock" style="display:none">
+          <h3>Device time (MQTT)</h3>
+          <div>Time topic: <span class="mono" data-role="timeTopic">-</span></div>
+          <div>time (ms): <span class="mono" data-role="timeMs">-</span></div>
+          <div>type / mid / eid / heart: <span class="mono" data-role="timeFields">-</span></div>
+          <pre class="healthRaw mono" data-role="timeRaw"></pre>
+        </div>
+        <div class="healthBlock" data-role="healthBlock">
+          <h3>Heartbeat</h3>
+          <div>Battery: <span class="mono" data-role="bat">-</span></div>
+          <div>RSSI: <span class="mono" data-role="rssi">-</span> dBm</div>
+          <div>Status: <span class="mono" data-role="healthStatus">-</span></div>
+          <div>Health topic: <span class="mono" data-role="healthTopic">-</span></div>
+          <div>Heartbeat at: <span class="mono" data-role="hbUpdated">-</span></div>
+          <pre class="healthRaw mono" data-role="healthRaw"></pre>
         </div>
         <div class="actions">
           <button data-role="startBtn">Start</button>
@@ -173,10 +238,24 @@
 
       const refs = {
         root,
+        serverRunning: false,
         watchEl: root.querySelector('[data-role="watch"]'),
         topicEl: root.querySelector('[data-role="topic"]'),
         updatedEl: root.querySelector('[data-role="updated"]'),
         stateEl: root.querySelector('[data-role="state"]'),
+        timeBlockEl: root.querySelector('[data-role="timeBlock"]'),
+        timeTopicEl: root.querySelector('[data-role="timeTopic"]'),
+        timeMsEl: root.querySelector('[data-role="timeMs"]'),
+        timeFieldsEl: root.querySelector('[data-role="timeFields"]'),
+        timeRawEl: root.querySelector('[data-role="timeRaw"]'),
+        friendlyNameRowEl: root.querySelector('[data-role="friendlyNameRow"]'),
+        friendlyNameEl: root.querySelector('[data-role="friendlyName"]'),
+        batEl: root.querySelector('[data-role="bat"]'),
+        rssiEl: root.querySelector('[data-role="rssi"]'),
+        healthStatusEl: root.querySelector('[data-role="healthStatus"]'),
+        healthTopicEl: root.querySelector('[data-role="healthTopic"]'),
+        hbUpdatedEl: root.querySelector('[data-role="hbUpdated"]'),
+        healthRawEl: root.querySelector('[data-role="healthRaw"]'),
         actionStatusEl: root.querySelector('[data-role="actionStatus"]'),
         startBtn: root.querySelector('[data-role="startBtn"]'),
         stopBtn: root.querySelector('[data-role="stopBtn"]'),
@@ -228,6 +307,99 @@
       statusEl.textContent = "Connected. Waiting for stopwatch data...";
     });
 
+    function applyHeartbeatToWidget(refs, msg) {
+      if (msg.id) {
+        refs.friendlyNameRowEl.style.display = "";
+        refs.friendlyNameEl.textContent = msg.id;
+      }
+      refs.batEl.textContent =
+        msg.bat !== undefined && msg.bat !== null ? String(msg.bat) : "-";
+      refs.rssiEl.textContent =
+        msg.rssi !== undefined && msg.rssi !== null ? String(msg.rssi) : "-";
+      refs.healthStatusEl.textContent = msg.status ? String(msg.status) : "-";
+      refs.healthTopicEl.textContent = msg.topic || "-";
+      if (msg.received_at) {
+        const d = new Date(msg.received_at);
+        refs.hbUpdatedEl.textContent = d.toLocaleString();
+      } else {
+        refs.hbUpdatedEl.textContent = "-";
+      }
+      if (msg.payload && typeof msg.payload === "object") {
+        refs.healthRawEl.textContent = JSON.stringify(msg.payload, null, 2);
+      } else {
+        refs.healthRawEl.textContent = "";
+      }
+    }
+
+    stream.addEventListener("server_tick", (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        const deviceId = (msg.device_id || "").trim();
+        if (!deviceId) {
+          return;
+        }
+        const refs = getOrCreateWidget(deviceId);
+        refs.serverRunning = true;
+        refs.watchEl.textContent =
+          msg.elapsed_ms !== undefined && msg.elapsed_ms !== null
+            ? formatMsToWatch(msg.elapsed_ms)
+            : msg.display || "00:00:00.00";
+        refs.stateEl.textContent = "Running (server)";
+        refs.topicEl.textContent = "—";
+        refs.updatedEl.textContent = "-";
+        statusEl.textContent = "Live stream connected";
+      } catch (err) {
+        statusEl.textContent = "Received malformed server_tick payload";
+      }
+    });
+
+    stream.addEventListener("timing", (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        const deviceId = (msg.device_id || "").trim();
+        if (!deviceId) {
+          return;
+        }
+        const refs = getOrCreateWidget(deviceId);
+        refs.serverRunning = false;
+        refs.watchEl.textContent =
+          msg.time_ms !== undefined && msg.time_ms !== null
+            ? formatMsToWatch(msg.time_ms)
+            : msg.display || "00:00:00.00";
+        refs.stateEl.textContent = "Stopped (device)";
+        refs.topicEl.textContent = msg.topic || "-";
+        if (msg.received_at) {
+          const d = new Date(msg.received_at);
+          refs.updatedEl.textContent = d.toLocaleTimeString();
+        } else {
+          refs.updatedEl.textContent = "-";
+        }
+        refs.timeBlockEl.style.display = "";
+        refs.timeTopicEl.textContent = msg.topic || "-";
+        refs.timeMsEl.textContent =
+          msg.time_ms !== undefined && msg.time_ms !== null ? String(msg.time_ms) : "-";
+        const parts = [
+          msg.type !== undefined && msg.type !== null ? `type=${msg.type}` : null,
+          msg.mid !== undefined && msg.mid !== null ? `mid=${msg.mid}` : null,
+          msg.eid !== undefined && msg.eid !== null ? `eid=${msg.eid}` : null,
+          msg.heart !== undefined && msg.heart !== null ? `heart=${msg.heart}` : null,
+        ].filter(Boolean);
+        refs.timeFieldsEl.textContent = parts.length ? parts.join(", ") : "-";
+        if (msg.payload && typeof msg.payload === "object") {
+          refs.timeRawEl.textContent = JSON.stringify(msg.payload, null, 2);
+        } else {
+          refs.timeRawEl.textContent = "";
+        }
+        if (msg.id) {
+          refs.friendlyNameRowEl.style.display = "";
+          refs.friendlyNameEl.textContent = msg.id;
+        }
+        statusEl.textContent = "Live stream connected";
+      } catch (err) {
+        statusEl.textContent = "Received malformed timing payload";
+      }
+    });
+
     stream.addEventListener("stopwatch", (evt) => {
       try {
         const msg = JSON.parse(evt.data);
@@ -236,7 +408,13 @@
           return;
         }
         const refs = getOrCreateWidget(deviceId);
-        refs.watchEl.textContent = msg.data || "00:00:00.00";
+        if (refs.serverRunning) {
+          return;
+        }
+        refs.watchEl.textContent =
+          msg.time_ms !== undefined && msg.time_ms !== null
+            ? formatMsToWatch(msg.time_ms)
+            : msg.data || "00:00:00.00";
         refs.topicEl.textContent = msg.topic || "-";
         refs.stateEl.textContent = formatStatus(msg.status);
 
@@ -250,6 +428,21 @@
         statusEl.textContent = "Live stream connected";
       } catch (err) {
         statusEl.textContent = "Received malformed event payload";
+      }
+    });
+
+    stream.addEventListener("heartbeat", (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        const deviceId = (msg.device_id || "").trim();
+        if (!deviceId) {
+          return;
+        }
+        const refs = getOrCreateWidget(deviceId);
+        applyHeartbeatToWidget(refs, msg);
+        statusEl.textContent = "Live stream connected";
+      } catch (err) {
+        statusEl.textContent = "Received malformed heartbeat payload";
       }
     });
 

@@ -1,15 +1,24 @@
-## Go backend for ESP32 BLE provisioning
+## Go backend for ESP32 BLE provisioning and stopwatch
 
-This Go application mirrors the main functionality of the FastAPI backend in `app/backend`:
+This Go application mirrors the main functionality of the FastAPI backend in `app/backend`, and adds MQTT-driven stopwatch monitoring plus a small web dashboard.
 
-- **`GET /health`**: returns a simple health check (`{"status":"ok"}`).
-- **`GET /api/config`**: returns the current configuration that the Go app is using.
-- **`GET /api/devices`**: scans for ESP32 devices over BLE and returns a list of devices (in mock mode by default).
-- **`POST /api/devices/{device_id}/wifi`**: sends WiFi credentials to a specific device over BLE and returns a result whose `message` is whatever the device reports (e.g. IP address).
-- **`GET /api/mqtt/stream`**: opens an SSE stream with real-time stopwatch data for frontend clients.
-- **`POST /api/mqtt/devices/{device_id}/{command}`**: publishes stopwatch commands (`start`, `stop`, `reset`) to MQTT.
+### Quick feature list
+
+- **`GET /health`**: health check (`{"status":"ok"}`).
+- **`GET /api/config`**: effective runtime configuration (including MQTT topic names).
+- **`GET /api/devices`**: BLE scan for ESP32 devices (mock BLE by default).
+- **`POST /api/devices/{device_id}/wifi`**: provision WiFi over BLE for one device.
+- **`POST /api/devices/wifi/batch`**: provision WiFi for multiple devices in one request (same SSID/credentials).
+- **`GET /api/mqtt/stream`**: Server-Sent Events (SSE) stream for the dashboard (stopwatch, heartbeat, server ticks, device timing).
+- **`POST /api/mqtt/devices/{device_id}/{command}`**: publish `start`, `stop`, or `reset` to MQTT (`stopwatch/{device_id}/cmd` by default) and run or stop the server-side stopwatch as described below.
 
 The JSON shapes for `DeviceSummary`, `WifiConfig`, `WifiProvisionResult`, and `HealthStatus` are compatible with the FastAPI models.
+
+### Web dashboard
+
+Static UI is served at `/` and `/index.html` from `web/index.html`. It connects to **`GET /api/mqtt/stream`** and shows one card per `device_id`: live stopwatch, MQTT start/stop/reset, optional manual device entry, heartbeat fields, and device-reported timing when present.
+
+---
 
 ## Frontend REST API reference
 
@@ -17,179 +26,135 @@ Base URL (default): `http://localhost:8000`
 
 ### 1) Health and app config
 
-- **`GET /health`**
-  - Purpose: backend health check.
-  - Success response:
-    - `200 OK`
-    - `{"status":"ok"}`
+- **`GET /health`** → `200 OK`, `{"status":"ok"}`.
 
-- **`GET /api/config`**
-  - Purpose: expose effective runtime configuration used by frontend.
-  - Success response:
-    - `200 OK`
-    - JSON object with fields such as `app_name`, `port`, `mock_ble`, `mqtt_enabled`, `mqtt_publish_topic`, `mqtt_subscribe_topic`.
+- **`GET /api/config`** → `200 OK`, JSON including for example:
+  - `app_name`, `port`, `mock_ble`
+  - `mqtt_enabled`, `mqtt_broker_host`, `mqtt_broker_port`
+  - `mqtt_publish_topic`, `mqtt_subscribe_topic`, `mqtt_subscribe_health_topic`, `mqtt_subscribe_time_topic`
+  - `mqtt_username` (password is never returned)
 
 ### 2) BLE device discovery and WiFi provisioning
 
-- **`GET /api/devices`**
-  - Purpose: scan BLE and return matching devices.
-  - Success response:
-    - `200 OK`
-    - JSON array of devices:
-      - `id` (string)
-      - `name` (string, optional)
-      - `rssi` (number, optional)
+- **`GET /api/devices`**  
+  - `200 OK`: JSON array of `{ "id", "name"?, "rssi"? }`.
 
-- **`POST /api/devices/{device_id}/wifi`**
-  - Purpose: send WiFi credentials to selected BLE device.
-  - Path param:
-    - `device_id` from `/api/devices`.
-  - Request body (`application/json`):
-    - `ssid` (required)
-    - `password` (optional; alias of `pass`)
-    - `pass` (optional; alias of `password`)
-  - Example body:
-    - `{"ssid":"MyWifi","password":"secret"}`
-  - Success response:
-    - `200 OK`
-    - `{"success":true|false,"message":"..."}`  
-      (`message` contains device status/IP when available)
-  - Error responses:
-    - `400 Bad Request` for invalid JSON or missing `ssid`.
-    - `405 Method Not Allowed` for unsupported methods.
+- **`POST /api/devices/{device_id}/wifi`**  
+  - Body: `{"ssid":"...","password":"..."}` (or `"pass"` instead of `password"`).  
+  - `200 OK`: `{"success":bool,"message":"..."}` (e.g. IP or status from firmware).
 
-### 3) Stopwatch control and real-time updates
+- **`POST /api/devices/wifi/batch`**  
+  - Body: `{"device_ids":["id1","id2"],"ssid":"...","password":"..."}`.  
+  - `200 OK`: `total`, `success`, `failed`, `results[]` per device.
 
-- **`POST /api/mqtt/devices/{device_id}/{command}`**
-  - Purpose: publish stopwatch command to device via MQTT.
-  - Path params:
-    - `device_id` (target stopwatch device id).
-    - `command` must be one of: `start`, `stop`, `reset`.
-  - Request body:
-    - none.
-  - Success response:
-    - `200 OK`
-    - `{"success":true,"device_id":"...","topic":"...","message":"start|stop|reset"}`
-  - Error responses:
-    - `400 Bad Request` for invalid path/command.
-    - `503 Service Unavailable` if MQTT is disconnected/unavailable.
+### 3) MQTT commands and server-side stopwatch
 
-- **`GET /api/mqtt/stream`** (SSE endpoint used by frontend)
-  - Purpose: stream real-time stopwatch updates.
-  - Response headers:
-    - `Content-Type: text/event-stream`
-    - `Cache-Control: no-cache`
-    - `Connection: keep-alive`
-  - SSE events:
-    - `ready` event with `data: ok` when stream opens.
-    - `stopwatch` events where `data` is JSON:
-      - `device_id` (string)
-      - `data` (format `HH:MM:SS.hh`)
-      - `status` (`start|stop|reset`, optional)
-      - `topic` (MQTT topic string)
-      - `received_at` (UTC timestamp)
-  - Frontend note:
-    - use `EventSource('/api/mqtt/stream')` and parse `stopwatch` event payload.
+- **`POST /api/mqtt/devices/{device_id}/{command}`**  
+  - `command`: `start` | `stop` | `reset`.  
+  - Publishes the command string to the configured MQTT publish topic (default `stopwatch/{device_id}/cmd`).  
+  - **Start**: after a successful publish, the server starts a per-device stopwatch that emits **`server_tick`** SSE events (about every 50 ms). The displayed time **resumes from the last stopped value** for that `device_id` (not from zero), unless you use **reset** (see below).  
+  - **Stop**: stops the server stopwatch and **stores** the current elapsed time for the next **start**.  
+  - **Reset**: stops the server stopwatch and **clears** the stored elapsed time so the **next** start begins at `00:00:00.00`.  
+  - `503` if MQTT publish fails (e.g. broker disconnected).
+
+### 4) SSE: `GET /api/mqtt/stream`
+
+- Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`.
+- **`event: ready`** — `data: ok` when the connection is open.
+- **`event: stopwatch`** — JSON from topic `stopwatch/{device_id}/data`:
+  - `device_id`, `topic`, `received_at`
+  - `data`: clock string `HH:MM:SS.hh` when the payload uses legacy `data`, **or** derived from numeric/string **`time`** (milliseconds).
+  - `time_ms`: present when the JSON payload includes **`time`** (number or numeric string, in milliseconds).
+  - `status`: optional (`start` / `stop` / `reset`).
+  - While the **server** stopwatch is running for a device, **`/data` updates for that device are not forwarded** so the UI follows **`server_tick`** only.
+- **`event: heartbeat`** — JSON from `stopwatch/{device_id}/health` (battery, RSSI, status, full payload map, etc.).
+- **`event: server_tick`** — JSON while the server stopwatch is running:
+  - `device_id`, `display`, `elapsed_ms`, `received_at`.
+- **`event: timing`** — JSON from `stopwatch/{device_id}/time` (device-reported result after stop/reset), e.g.:
+  - `time_ms`, `display`, `id`, `type`, `mid`, `eid`, `heart`, `payload`, `topic`, `received_at`.  
+  - String fields like `"time":"3453"` are parsed as milliseconds.  
+  - On receipt, the server updates the **resume** value for the next **start** to match the device.
+
+Use `EventSource('/api/mqtt/stream')` and listen for the event names above.
+
+---
 
 ### Prerequisites
 
 - Go 1.22 or newer.
-- Optional: a `.env` file in this directory if you want to override defaults.
+- Optional: a `.env` file in the project directory to override defaults.
 
 ### Configuration
 
-The Go app reads configuration from environment variables (and an optional local `.env` file) similar to the Python `Settings`:
+Environment variables (and optional `.env`):
 
-- **`APP_NAME`**: application name (default: `ESP32 Backend (Go)`).
-- **`DEBUG`**: enable debug mode (`true`/`false`, default: `false`).
-- **`PORT`**: HTTP port to listen on (default: `8000`).
-- **`BLE_NAME_PREFIX`**: BLE device name prefix to filter on (default: `ESP-Setup-`).
-- **`MOCK_BLE`**: when `true`, use an in-memory mock BLE implementation (default: `true`).
-- **`WIFI_SERVICE_UUID`**: WiFi provisioning service UUID.
-- **`WIFI_CONFIG_CHAR_UUID`**: characteristic UUID used to send WiFi config.
-- **`WIFI_STATUS_CHAR_UUID`**: characteristic UUID used for status/indication.
-- **`MQTT_ENABLED`**: connect to the MQTT broker on server startup (`true`/`false`, default: `true`).
-- **`MQTT_BROKER_HOST`**: MQTT broker host (default: `localhost`).
-- **`MQTT_BROKER_PORT`**: MQTT broker port (default: `1883`).
-- **`MQTT_PUBLISH_TOPIC`**: publish topic template (default: `stopwatch/{device_id}/cmd`). Supports `{device_id}` placeholder.
-- **`MQTT_SUBSCRIBE_TOPIC`**: subscribe topic (default: `stopwatch/+/data`).
-- **`MQTT_USERNAME`**: optional MQTT username (default: empty).
-- **`MQTT_PASSWORD`**: optional MQTT password (default: empty).
-- **`MQTT_CONNECT_TIMEOUT_SEC`**: how long to wait for the initial MQTT connection (default: `5`).
+| Variable | Default | Notes |
+|----------|---------|--------|
+| `APP_NAME` | `ESP32 Backend (Go)` | |
+| `DEBUG` | `false` | |
+| `PORT` | `8000` | HTTP listen port |
+| `BLE_NAME_PREFIX` | `ESP-Setup-` | BLE name filter |
+| `MOCK_BLE` | `true` | Mock BLE devices and WiFi provisioning |
+| `WIFI_SERVICE_UUID` | (see `main.go`) | WiFi provisioning service |
+| `WIFI_CONFIG_CHAR_UUID` | (see `main.go`) | WiFi config characteristic |
+| `WIFI_STATUS_CHAR_UUID` | (see `main.go`) | Status / indication characteristic |
+| `MQTT_ENABLED` | `true` | |
+| `MQTT_BROKER_HOST` | `localhost` | |
+| `MQTT_BROKER_PORT` | `1883` | |
+| `MQTT_PUBLISH_TOPIC` | `stopwatch/{device_id}/cmd` | `{device_id}` placeholder supported |
+| `MQTT_SUBSCRIBE_TOPIC` | `stopwatch/+/data` | Live stopwatch JSON |
+| `MQTT_SUBSCRIBE_HEALTH_TOPIC` | `stopwatch/+/health` | Device heartbeat |
+| `MQTT_SUBSCRIBE_TIME_TOPIC` | `stopwatch/+/time` | Final timing after stop/reset |
+| `MQTT_USERNAME` | `""` | MQTT auth (optional) |
+| `MQTT_PASSWORD` | `""` | MQTT auth (optional) |
+| `MQTT_CLIENT_ID` | auto | Empty → random client id |
+| `MQTT_CONNECT_TIMEOUT_SEC` | `5` | Initial broker connect wait |
 
-By default `MOCK_BLE=true`, which is similar to the Python backend’s default; this returns fake devices and simulates WiFi provisioning so you can develop the frontend without needing real hardware.
+With `MOCK_BLE=true` (default), you get fake BLE devices and simulated WiFi provisioning without hardware.
 
 ### Running the server
 
-From this directory (`app/golang`):
+From this directory (`stopwatch-golang`):
 
-- **Install dependencies (first time only)**:
+```bash
+go mod tidy
+go run ./...
+```
 
-  ```bash
-  go mod tidy
-  ```
-
-- **Run the server**:
-
-  ```bash
-  go run ./...
-  ```
-
-The server will start on `http://localhost:8000` by default (or the port specified by `PORT` in `.env` or the environment).
+The server listens on `http://localhost:8000` by default (or `PORT` from the environment / `.env`).
 
 #### Example HTTP requests
 
-- **Health check**:
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/api/config
+curl http://localhost:8000/api/devices
+```
 
-  ```bash
-  curl http://localhost:8000/health
-  ```
+```bash
+curl -X POST "http://localhost:8000/api/devices/FAKE:01/wifi" \
+  -H "Content-Type: application/json" \
+  -d '{"ssid":"MyWifi","password":"secret"}'
+```
 
-- **Show config**:
+```bash
+curl -X POST "http://localhost:8000/api/mqtt/devices/FAKE:01/start"
+```
 
-  ```bash
-  curl http://localhost:8000/api/config
-  ```
-
-- **List devices**:
-
-  ```bash
-  curl http://localhost:8000/api/devices
-  ```
-
-- **Configure WiFi for a device (Windows PowerShell example)**:
-
-  ```powershell
-  curl -X POST "http://localhost:8000/api/devices/FAKE:01/wifi" `
-    -H "Content-Type: application/json" `
-    -d "{\"ssid\":\"MyWifi\",\"password\":\"secret\"}"
-  ```
-
-- **Configure WiFi for a device (Linux/macOS bash example)**:
-
-  ```bash
-  curl -X POST "http://localhost:8000/api/devices/FAKE:01/wifi" \
-    -H "Content-Type: application/json" \
-    -d '{"ssid":"MyWifi","password":"secret"}'
-  ```
-
-In real BLE mode, replace `FAKE:01` with the actual `id` returned by `/api/devices`. The `message` field of the JSON response will contain the device status or IP address reported by the ESP32 firmware.
+In real BLE mode, replace `FAKE:01` with the `id` from `GET /api/devices`.
 
 ### Real BLE implementation
 
-The `main.go` file defines a `BLEService` interface and provides:
+`main.go` defines a `BLEService` interface and provides:
 
-- `mockBLEService`: fully functional mock, matching the Python `MOCK_BLE` behavior.
-- `realBLEService`: a placeholder where you can plug in a real BLE library (for example, `github.com/go-ble/ble`) to:
-  - Discover devices with names starting with `BLE_NAME_PREFIX`.
-  - Connect to the device identified by `device_id`.
-  - Write WiFi credentials as a JSON payload (`{"ssid": "...", "pass": "..."}`) to the config characteristic (`WIFI_CONFIG_CHAR_UUID`).
-  - Subscribe to indications on that characteristic and use the indication payload (e.g. IP address) as the `message` field in `WifiProvisionResult`.
+- **`mockBLEService`**: matches Python `MOCK_BLE` behavior.
+- **`realBLEService`**: discovers devices by `BLE_NAME_PREFIX`, connects, writes WiFi JSON `{"ssid","pass"}` to the config characteristic, and reads status/indications.
 
-Once you implement `realBLEService`, you can run the Go app with:
+To use real BLE:
 
 ```bash
 set MOCK_BLE=false
 go run ./...
 ```
 
+(On Linux/macOS use `export MOCK_BLE=false`.)

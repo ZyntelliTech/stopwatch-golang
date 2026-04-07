@@ -34,14 +34,64 @@ var (
 
 	// In-memory realtime stream hub for frontend clients (SSE).
 	realtimeHub = struct {
-		mu      sync.RWMutex
-		latest  map[string]StopwatchRealtimeEvent
-		clients map[chan StopwatchRealtimeEvent]struct{}
+		mu               sync.RWMutex
+		latest           map[string]StopwatchRealtimeEvent
+		latestHealth     map[string]DeviceHeartbeatEvent
+		latestTiming     map[string]DeviceTimeEvent
+		latestServerTick map[string]ServerTickEvent
+		clients          map[chan streamEvent]struct{}
 	}{
-		latest:  make(map[string]StopwatchRealtimeEvent),
-		clients: make(map[chan StopwatchRealtimeEvent]struct{}),
+		latest:           make(map[string]StopwatchRealtimeEvent),
+		latestHealth:     make(map[string]DeviceHeartbeatEvent),
+		latestTiming:     make(map[string]DeviceTimeEvent),
+		latestServerTick: make(map[string]ServerTickEvent),
+		clients:          make(map[chan streamEvent]struct{}),
 	}
+
+	// Per-device server-side stopwatch (started when UI sends "start" after MQTT publish).
+	serverStopMu sync.Mutex
+	serverRuns   = map[string]*serverRun{}
+	// Elapsed ms to resume from after stop (not cleared on start; cleared on reset or overwritten on next stop).
+	deviceLastElapsedMs = map[string]int64{}
 )
+
+type serverRun struct {
+	cancel   context.CancelFunc
+	startAt  time.Time
+	offsetMs int64 // carried from last stop / device time; added to wall elapsed each tick
+}
+
+// streamEvent is sent to SSE clients (stopwatch ticks or device heartbeat).
+type streamEvent struct {
+	Kind       string
+	Stopwatch  StopwatchRealtimeEvent
+	Heartbeat  DeviceHeartbeatEvent
+	Timing     DeviceTimeEvent
+	ServerTick ServerTickEvent
+}
+
+// ServerTickEvent is emitted while the server-side stopwatch is running for a device.
+type ServerTickEvent struct {
+	DeviceID   string    `json:"device_id"`
+	Display    string    `json:"display"`
+	ElapsedMs  int64     `json:"elapsed_ms"`
+	ReceivedAt time.Time `json:"received_at"`
+}
+
+// DeviceTimeEvent is emitted when MQTT receives stopwatch/{device_id}/time (device-reported result).
+type DeviceTimeEvent struct {
+	DeviceID   string         `json:"device_id"`
+	Topic      string         `json:"topic"`
+	Payload    map[string]any `json:"payload,omitempty"`
+	TimeMs     int64          `json:"time_ms,omitempty"`
+	Display    string         `json:"display"`
+	ID         string         `json:"id,omitempty"`
+	Type       int            `json:"type,omitempty"`
+	Mid        int            `json:"mid,omitempty"`
+	Eid        int            `json:"eid,omitempty"`
+	Heart      int            `json:"heart,omitempty"`
+	ReceivedAt time.Time      `json:"received_at"`
+}
 
 func ensureBLEAdapterEnabled() error {
 	bleEnableOnce.Do(func() {
@@ -74,6 +124,10 @@ type Config struct {
 	// Publish topic supports a placeholder `{device_id}` for future use.
 	MQTTPublishTopic      string
 	MQTTSubscribeTopic    string
+	// MQTTSubscribeHealthTopic subscribes to device heartbeat (default: stopwatch/+/health).
+	MQTTSubscribeHealthTopic string
+	// MQTTSubscribeTimeTopic subscribes to device timing result (default: stopwatch/+/time).
+	MQTTSubscribeTimeTopic string
 	MQTTClientID           string
 	MQTTConnectTimeoutSec  int
 }
@@ -130,14 +184,22 @@ type HealthStatus struct {
 type StopwatchRealtimeEvent struct {
 	DeviceID   string    `json:"device_id"`
 	Data       string    `json:"data"`
+	TimeMs     int64     `json:"time_ms,omitempty"` // set when JSON payload includes "time" (milliseconds)
 	Status     string    `json:"status,omitempty"`
 	Topic      string    `json:"topic"`
 	ReceivedAt time.Time `json:"received_at"`
 }
 
-type mqttStopwatchPayload struct {
-	Data   string `json:"data"`
-	Status string `json:"status"`
+// DeviceHeartbeatEvent is emitted when MQTT receives stopwatch/{device_id}/health.
+type DeviceHeartbeatEvent struct {
+	DeviceID   string         `json:"device_id"`
+	ID         string         `json:"id,omitempty"`
+	Battery    int            `json:"bat,omitempty"`
+	RSSI       int            `json:"rssi,omitempty"`
+	Status     string         `json:"status,omitempty"`
+	Topic      string         `json:"topic"`
+	Payload    map[string]any `json:"payload,omitempty"`
+	ReceivedAt time.Time      `json:"received_at"`
 }
 
 // BLEService abstracts BLE operations so we can plug in
@@ -646,7 +708,7 @@ func main() {
 		w.Header().Set("Connection", "keep-alive")
 
 		// Buffered channel so brief frontend hiccups do not block MQTT callback.
-		ch := make(chan StopwatchRealtimeEvent, 256)
+		ch := make(chan streamEvent, 256)
 		registerRealtimeClient(ch)
 		defer unregisterRealtimeClient(ch)
 
@@ -663,17 +725,64 @@ func main() {
 			_, _ = fmt.Fprintf(w, "event: stopwatch\ndata: %s\n\n", b)
 			flusher.Flush()
 		}
+		for _, ev := range latestHeartbeatSnapshot() {
+			b, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			_, _ = fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", b)
+			flusher.Flush()
+		}
+		for _, ev := range latestServerTickSnapshot() {
+			b, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			_, _ = fmt.Fprintf(w, "event: server_tick\ndata: %s\n\n", b)
+			flusher.Flush()
+		}
+		for _, ev := range latestTimingSnapshot() {
+			b, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			_, _ = fmt.Fprintf(w, "event: timing\ndata: %s\n\n", b)
+			flusher.Flush()
+		}
 
 		for {
 			select {
 			case <-r.Context().Done():
 				return
-			case ev := <-ch:
-				b, err := json.Marshal(ev)
-				if err != nil {
+			case msg := <-ch:
+				switch msg.Kind {
+				case "heartbeat":
+					b, err := json.Marshal(msg.Heartbeat)
+					if err != nil {
+						continue
+					}
+					_, _ = fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", b)
+				case "stopwatch":
+					b, err := json.Marshal(msg.Stopwatch)
+					if err != nil {
+						continue
+					}
+					_, _ = fmt.Fprintf(w, "event: stopwatch\ndata: %s\n\n", b)
+				case "server_tick":
+					b, err := json.Marshal(msg.ServerTick)
+					if err != nil {
+						continue
+					}
+					_, _ = fmt.Fprintf(w, "event: server_tick\ndata: %s\n\n", b)
+				case "timing":
+					b, err := json.Marshal(msg.Timing)
+					if err != nil {
+						continue
+					}
+					_, _ = fmt.Fprintf(w, "event: timing\ndata: %s\n\n", b)
+				default:
 					continue
 				}
-				_, _ = fmt.Fprintf(w, "event: stopwatch\ndata: %s\n\n", b)
 				flusher.Flush()
 			}
 		}
@@ -719,6 +828,16 @@ func main() {
 			log.Printf("mqtt publish failed (topic=%s): %v", topic, err)
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
+		}
+
+		switch command {
+		case "start":
+			startServerStopwatch(deviceID)
+		case "stop":
+			stopServerStopwatch(deviceID)
+		case "reset":
+			stopServerStopwatch(deviceID)
+			clearDeviceLastElapsed(deviceID)
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -774,6 +893,8 @@ func loadConfig() (*Config, error) {
 		// subscribe -> stopwatch/+/data
 		MQTTPublishTopic:      getEnv("MQTT_PUBLISH_TOPIC", "stopwatch/{device_id}/cmd"),
 		MQTTSubscribeTopic:    getEnv("MQTT_SUBSCRIBE_TOPIC", "stopwatch/+/data"),
+		MQTTSubscribeHealthTopic: getEnv("MQTT_SUBSCRIBE_HEALTH_TOPIC", "stopwatch/+/health"),
+		MQTTSubscribeTimeTopic: getEnv("MQTT_SUBSCRIBE_TIME_TOPIC", "stopwatch/+/time"),
 		MQTTClientID:          getEnv("MQTT_CLIENT_ID", ""),
 		MQTTConnectTimeoutSec: getEnvAsInt("MQTT_CONNECT_TIMEOUT_SEC", 5),
 	}
@@ -796,6 +917,8 @@ func configForDisplay(cfg *Config) map[string]any {
 		"mqtt_broker_port": cfg.MQTTBrokerPort,
 		"mqtt_publish_topic":  cfg.MQTTPublishTopic,
 		"mqtt_subscribe_topic": cfg.MQTTSubscribeTopic,
+		"mqtt_subscribe_health_topic": cfg.MQTTSubscribeHealthTopic,
+		"mqtt_subscribe_time_topic": cfg.MQTTSubscribeTimeTopic,
 		"mqtt_username":    cfg.MQTTUsername,
 		// Intentionally omit password (secrets).
 		"_go_backend":          true,
@@ -827,25 +950,38 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 
 	opts.OnConnect = func(client mqtt.Client) {
 		logger.Printf("Connected to MQTT broker %s", brokerURL)
-		subscribeTopic := strings.TrimSpace(cfg.MQTTSubscribeTopic)
-		if subscribeTopic == "" {
-			logger.Printf("MQTT subscribe topic is empty; skipping subscribe")
-			return
+
+		onMessage := func(_ mqtt.Client, msg mqtt.Message) {
+			topic := msg.Topic()
+			payload := string(msg.Payload())
+			switch {
+			case strings.HasSuffix(topic, "/data"):
+				handleStopwatchMQTTMessage(logger, topic, payload)
+			case strings.HasSuffix(topic, "/health"):
+				handleHeartbeatMQTTMessage(logger, topic, payload)
+			case strings.HasSuffix(topic, "/time"):
+				handleTimeMQTTMessage(logger, topic, payload)
+			default:
+				logger.Printf("Ignoring MQTT message on unexpected topic: %s", topic)
+			}
 		}
 
-		// Subscribe on every (re)connect to ensure data stream continues after reconnect.
-		subToken := client.Subscribe(subscribeTopic, 0, func(_ mqtt.Client, msg mqtt.Message) {
-			handleStopwatchMQTTMessage(logger, msg.Topic(), string(msg.Payload()))
-		})
-		if !subToken.WaitTimeout(5 * time.Second) {
-			logger.Printf("MQTT subscribe timed out for topic %s", subscribeTopic)
-			return
+		for _, subscribeTopic := range mqttSubscribeTopics(cfg) {
+			subscribeTopic = strings.TrimSpace(subscribeTopic)
+			if subscribeTopic == "" {
+				continue
+			}
+			subToken := client.Subscribe(subscribeTopic, 0, onMessage)
+			if !subToken.WaitTimeout(5 * time.Second) {
+				logger.Printf("MQTT subscribe timed out for topic %s", subscribeTopic)
+				continue
+			}
+			if err := subToken.Error(); err != nil {
+				logger.Printf("MQTT subscribe error for topic %s: %v", subscribeTopic, err)
+				continue
+			}
+			logger.Printf("Subscribed to MQTT topic %s", subscribeTopic)
 		}
-		if err := subToken.Error(); err != nil {
-			logger.Printf("MQTT subscribe error for topic %s: %v", subscribeTopic, err)
-			return
-		}
-		logger.Printf("Subscribed to MQTT topic %s", subscribeTopic)
 	}
 	opts.OnConnectionLost = func(_ mqtt.Client, err error) {
 		logger.Printf("MQTT connection lost: %v", err)
@@ -870,27 +1006,66 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 	return c
 }
 
+func mqttSubscribeTopics(cfg *Config) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, t := range []string{cfg.MQTTSubscribeTopic, cfg.MQTTSubscribeHealthTopic, cfg.MQTTSubscribeTimeTopic} {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
 func handleStopwatchMQTTMessage(logger *log.Logger, topic, payload string) {
-	deviceID, ok := parseDeviceIDFromStopwatchTopic(topic)
+	deviceID, ok := parseDeviceIDFromTopic(topic, "data")
 	if !ok {
 		// Keep this warning because a wrong topic pattern means bad routing.
 		logger.Printf("Ignoring MQTT message with unexpected topic: %s", topic)
 		return
 	}
-
-	payload = strings.TrimSpace(payload)
-	value := payload
-	status := ""
-
-	// New device format: {"data":"11:22:33.55","status":"start"}
-	var parsed mqttStopwatchPayload
-	if err := json.Unmarshal([]byte(payload), &parsed); err == nil && strings.TrimSpace(parsed.Data) != "" {
-		value = strings.TrimSpace(parsed.Data)
-		status = strings.ToLower(strings.TrimSpace(parsed.Status))
+	if isServerRunning(deviceID) {
+		// While the server-side stopwatch is running, live /data updates are suppressed so the UI follows server ticks.
+		return
 	}
 
-	if !stopwatchDataRe.MatchString(value) {
-		// Validate format strictly: 00:00:00.00
+	payload = strings.TrimSpace(payload)
+	var value string
+	status := ""
+	var timeMs int64
+	hasTimeMs := false
+
+	// JSON: prefer numeric "time" (milliseconds) for the displayed stopwatch; else use string "data" (HH:MM:SS.hh).
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(payload), &raw); err == nil {
+		if v, ok := raw["time"]; ok {
+			if ms, ok := int64FromJSONAny(v); ok {
+				timeMs = ms
+				hasTimeMs = true
+				value = formatDurationToWatch(ms)
+			}
+		}
+		if s, ok := raw["status"].(string); ok {
+			status = strings.ToLower(strings.TrimSpace(s))
+		}
+		if !hasTimeMs {
+			if d, ok := raw["data"].(string); ok {
+				value = strings.TrimSpace(d)
+			}
+		}
+	}
+	if value == "" {
+		value = payload
+	}
+
+	if !hasTimeMs && !stopwatchDataRe.MatchString(value) {
+		// Without "time" (ms), require legacy HH:MM:SS.hh in data or raw payload.
 		logger.Printf("Ignoring MQTT payload with invalid stopwatch format (topic=%s payload=%q)", topic, payload)
 		return
 	}
@@ -913,16 +1088,264 @@ func handleStopwatchMQTTMessage(logger *log.Logger, topic, payload string) {
 		Topic:      topic,
 		ReceivedAt: time.Now().UTC(),
 	}
+	if hasTimeMs {
+		ev.TimeMs = timeMs
+	}
 	publishRealtimeEvent(ev)
 }
 
-func parseDeviceIDFromStopwatchTopic(topic string) (string, bool) {
-	// Expected pattern: stopwatch/{device_id}/data
+func handleHeartbeatMQTTMessage(logger *log.Logger, topic, payload string) {
+	deviceID, ok := parseDeviceIDFromTopic(topic, "health")
+	if !ok {
+		logger.Printf("Ignoring MQTT heartbeat with unexpected topic: %s", topic)
+		return
+	}
+
+	payload = strings.TrimSpace(payload)
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		logger.Printf("Ignoring invalid heartbeat JSON (topic=%s): %v", topic, err)
+		return
+	}
+
+	ev := DeviceHeartbeatEvent{
+		DeviceID:   deviceID,
+		Topic:      topic,
+		Payload:    raw,
+		ReceivedAt: time.Now().UTC(),
+	}
+
+	if v, ok := raw["id"].(string); ok {
+		ev.ID = strings.TrimSpace(v)
+	}
+	if v, ok := raw["bat"]; ok {
+		switch n := v.(type) {
+		case float64:
+			ev.Battery = int(n)
+		case int:
+			ev.Battery = n
+		case int64:
+			ev.Battery = int(n)
+		}
+	}
+	if v, ok := raw["rssi"]; ok {
+		switch n := v.(type) {
+		case float64:
+			ev.RSSI = int(n)
+		case int:
+			ev.RSSI = n
+		case int64:
+			ev.RSSI = int(n)
+		}
+	}
+	if v, ok := raw["status"].(string); ok {
+		ev.Status = strings.TrimSpace(v)
+	}
+
+	logger.Printf("MQTT heartbeat device=%s id=%s bat=%d rssi=%d status=%s", deviceID, ev.ID, ev.Battery, ev.RSSI, ev.Status)
+	publishHeartbeatEvent(ev)
+}
+
+func handleTimeMQTTMessage(logger *log.Logger, topic, payload string) {
+	deviceID, ok := parseDeviceIDFromTopic(topic, "time")
+	if !ok {
+		logger.Printf("Ignoring MQTT time with unexpected topic: %s", topic)
+		return
+	}
+
+	stopServerStopwatch(deviceID)
+
+	payload = strings.TrimSpace(payload)
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		logger.Printf("Ignoring invalid time JSON (topic=%s): %v", topic, err)
+		return
+	}
+
+	var timeMs int64
+	if v, ok := raw["time"]; ok {
+		if n, ok := int64FromJSONAny(v); ok {
+			timeMs = n
+		}
+	}
+
+	// Next Start resumes from device-reported time (ms).
+	setDeviceLastElapsed(deviceID, timeMs)
+
+	ev := DeviceTimeEvent{
+		DeviceID:   deviceID,
+		Topic:      topic,
+		Payload:    raw,
+		TimeMs:     timeMs,
+		Display:    formatDurationToWatch(timeMs),
+		ReceivedAt: time.Now().UTC(),
+	}
+	if v, ok := raw["id"].(string); ok {
+		ev.ID = strings.TrimSpace(v)
+	}
+	if v, ok := raw["type"]; ok {
+		if n, ok := intFromJSONAny(v); ok {
+			ev.Type = n
+		}
+	}
+	if v, ok := raw["mid"]; ok {
+		if n, ok := intFromJSONAny(v); ok {
+			ev.Mid = n
+		}
+	}
+	if v, ok := raw["eid"]; ok {
+		if n, ok := intFromJSONAny(v); ok {
+			ev.Eid = n
+		}
+	}
+	if v, ok := raw["heart"]; ok {
+		if n, ok := intFromJSONAny(v); ok {
+			ev.Heart = n
+		}
+	}
+
+	logger.Printf("MQTT time device=%s time_ms=%d display=%s", deviceID, timeMs, ev.Display)
+	publishTimingEvent(ev)
+}
+
+func formatDurationToWatch(ms int64) string {
+	if ms < 0 {
+		ms = 0
+	}
+	h := ms / 3600000
+	ms %= 3600000
+	m := ms / 60000
+	ms %= 60000
+	s := ms / 1000
+	frac := (ms % 1000) / 10
+	if frac > 99 {
+		frac = 99
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%02d", h, m, s, frac)
+}
+
+func int64FromJSONAny(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0, false
+		}
+		i, err := strconv.ParseInt(s, 10, 64)
+		return i, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func intFromJSONAny(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0, false
+		}
+		i, err := strconv.Atoi(s)
+		return i, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func isServerRunning(deviceID string) bool {
+	serverStopMu.Lock()
+	defer serverStopMu.Unlock()
+	_, ok := serverRuns[deviceID]
+	return ok
+}
+
+func startServerStopwatch(deviceID string) {
+	serverStopMu.Lock()
+	if r, ok := serverRuns[deviceID]; ok {
+		elapsed := time.Since(r.startAt).Milliseconds() + r.offsetMs
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		deviceLastElapsedMs[deviceID] = elapsed
+		r.cancel()
+		delete(serverRuns, deviceID)
+	}
+	offsetMs := deviceLastElapsedMs[deviceID]
+	ctx, cancel := context.WithCancel(context.Background())
+	startAt := time.Now()
+	serverRuns[deviceID] = &serverRun{cancel: cancel, startAt: startAt, offsetMs: offsetMs}
+	serverStopMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				ms := time.Since(startAt).Milliseconds() + offsetMs
+				if ms < 0 {
+					ms = 0
+				}
+				display := formatDurationToWatch(ms)
+				publishServerTick(deviceID, ms, display)
+			}
+		}
+	}()
+}
+
+func stopServerStopwatch(deviceID string) {
+	serverStopMu.Lock()
+	defer serverStopMu.Unlock()
+	if r, ok := serverRuns[deviceID]; ok {
+		elapsed := time.Since(r.startAt).Milliseconds() + r.offsetMs
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		deviceLastElapsedMs[deviceID] = elapsed
+		r.cancel()
+		delete(serverRuns, deviceID)
+	}
+}
+
+func setDeviceLastElapsed(deviceID string, ms int64) {
+	if ms < 0 {
+		ms = 0
+	}
+	serverStopMu.Lock()
+	deviceLastElapsedMs[deviceID] = ms
+	serverStopMu.Unlock()
+}
+
+func clearDeviceLastElapsed(deviceID string) {
+	serverStopMu.Lock()
+	delete(deviceLastElapsedMs, deviceID)
+	serverStopMu.Unlock()
+}
+
+func parseDeviceIDFromTopic(topic, suffix string) (string, bool) {
+	// Expected pattern: stopwatch/{device_id}/{suffix}
 	parts := strings.Split(topic, "/")
 	if len(parts) != 3 {
 		return "", false
 	}
-	if parts[0] != "stopwatch" || parts[2] != "data" {
+	if parts[0] != "stopwatch" || parts[2] != suffix {
 		return "", false
 	}
 	deviceID := strings.TrimSpace(parts[1])
@@ -932,13 +1355,13 @@ func parseDeviceIDFromStopwatchTopic(topic string) (string, bool) {
 	return deviceID, true
 }
 
-func registerRealtimeClient(ch chan StopwatchRealtimeEvent) {
+func registerRealtimeClient(ch chan streamEvent) {
 	realtimeHub.mu.Lock()
 	realtimeHub.clients[ch] = struct{}{}
 	realtimeHub.mu.Unlock()
 }
 
-func unregisterRealtimeClient(ch chan StopwatchRealtimeEvent) {
+func unregisterRealtimeClient(ch chan streamEvent) {
 	realtimeHub.mu.Lock()
 	delete(realtimeHub.clients, ch)
 	close(ch)
@@ -946,14 +1369,64 @@ func unregisterRealtimeClient(ch chan StopwatchRealtimeEvent) {
 }
 
 func publishRealtimeEvent(ev StopwatchRealtimeEvent) {
+	if isServerRunning(ev.DeviceID) {
+		return
+	}
 	realtimeHub.mu.Lock()
 	realtimeHub.latest[ev.DeviceID] = ev
+	msg := streamEvent{Kind: "stopwatch", Stopwatch: ev}
 
 	for ch := range realtimeHub.clients {
 		select {
-		case ch <- ev:
+		case ch <- msg:
 		default:
 			// Client is slow; drop this event for that client to avoid blocking.
+		}
+	}
+	realtimeHub.mu.Unlock()
+}
+
+func publishHeartbeatEvent(ev DeviceHeartbeatEvent) {
+	realtimeHub.mu.Lock()
+	realtimeHub.latestHealth[ev.DeviceID] = ev
+	msg := streamEvent{Kind: "heartbeat", Heartbeat: ev}
+
+	for ch := range realtimeHub.clients {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+	realtimeHub.mu.Unlock()
+}
+
+func publishServerTick(deviceID string, elapsedMs int64, display string) {
+	ev := ServerTickEvent{
+		DeviceID:   deviceID,
+		Display:    display,
+		ElapsedMs:  elapsedMs,
+		ReceivedAt: time.Now().UTC(),
+	}
+	realtimeHub.mu.Lock()
+	realtimeHub.latestServerTick[deviceID] = ev
+	msg := streamEvent{Kind: "server_tick", ServerTick: ev}
+	for ch := range realtimeHub.clients {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+	realtimeHub.mu.Unlock()
+}
+
+func publishTimingEvent(ev DeviceTimeEvent) {
+	realtimeHub.mu.Lock()
+	realtimeHub.latestTiming[ev.DeviceID] = ev
+	msg := streamEvent{Kind: "timing", Timing: ev}
+	for ch := range realtimeHub.clients {
+		select {
+		case ch <- msg:
+		default:
 		}
 	}
 	realtimeHub.mu.Unlock()
@@ -963,6 +1436,36 @@ func latestRealtimeSnapshot() []StopwatchRealtimeEvent {
 	realtimeHub.mu.RLock()
 	out := make([]StopwatchRealtimeEvent, 0, len(realtimeHub.latest))
 	for _, ev := range realtimeHub.latest {
+		out = append(out, ev)
+	}
+	realtimeHub.mu.RUnlock()
+	return out
+}
+
+func latestHeartbeatSnapshot() []DeviceHeartbeatEvent {
+	realtimeHub.mu.RLock()
+	out := make([]DeviceHeartbeatEvent, 0, len(realtimeHub.latestHealth))
+	for _, ev := range realtimeHub.latestHealth {
+		out = append(out, ev)
+	}
+	realtimeHub.mu.RUnlock()
+	return out
+}
+
+func latestServerTickSnapshot() []ServerTickEvent {
+	realtimeHub.mu.RLock()
+	out := make([]ServerTickEvent, 0, len(realtimeHub.latestServerTick))
+	for _, ev := range realtimeHub.latestServerTick {
+		out = append(out, ev)
+	}
+	realtimeHub.mu.RUnlock()
+	return out
+}
+
+func latestTimingSnapshot() []DeviceTimeEvent {
+	realtimeHub.mu.RLock()
+	out := make([]DeviceTimeEvent, 0, len(realtimeHub.latestTiming))
+	for _, ev := range realtimeHub.latestTiming {
 		out = append(out, ev)
 	}
 	realtimeHub.mu.RUnlock()

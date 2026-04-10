@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -53,7 +54,23 @@ var (
 	serverRuns   = map[string]*serverRun{}
 	// Elapsed ms to resume from after stop (not cleared on start; cleared on reset or overwritten on next stop).
 	deviceLastElapsedMs = map[string]int64{}
+
+	// Serialize config publish + subscribe handshake (same topic, QoS 1).
+	configAckMu sync.Mutex
+
+	// Per-device admin fields used to answer MQTT stopwatch/{id}/lcd/request on stopwatch/{id}/lcd/response.
+	requestProfileMu       sync.RWMutex
+	requestProfileByDevice = map[string]RequestResponseProfile{}
 )
+
+// RequestResponseProfile is stored per device_id and sent when the device publishes on .../lcd/request.
+type RequestResponseProfile struct {
+	AthleteName string `json:"athlete_name"`
+	EventLabel  string `json:"event_label"`
+	Eid         int    `json:"eid"`
+	Mid         int    `json:"mid"`
+	Heart       int    `json:"heart"`
+}
 
 type serverRun struct {
 	cancel   context.CancelFunc
@@ -63,11 +80,18 @@ type serverRun struct {
 
 // streamEvent is sent to SSE clients (stopwatch ticks or device heartbeat).
 type streamEvent struct {
-	Kind       string
-	Stopwatch  StopwatchRealtimeEvent
-	Heartbeat  DeviceHeartbeatEvent
-	Timing     DeviceTimeEvent
-	ServerTick ServerTickEvent
+	Kind         string
+	Stopwatch    StopwatchRealtimeEvent
+	Heartbeat    DeviceHeartbeatEvent
+	Timing       DeviceTimeEvent
+	ServerTick   ServerTickEvent
+	DeviceRename DeviceRenameEvent
+}
+
+// DeviceRenameEvent notifies the UI to drop a superseded device_id after server-side migration.
+type DeviceRenameEvent struct {
+	PreviousDeviceID string `json:"previous_device_id"`
+	DeviceID         string `json:"device_id"`
 }
 
 // ServerTickEvent is emitted while the server-side stopwatch is running for a device.
@@ -102,34 +126,42 @@ func ensureBLEAdapterEnabled() error {
 
 // Config holds application configuration (similar to the Python Settings model).
 type Config struct {
-	AppName          string
-	Debug            bool
-	Port             int
-	BLENamePrefix    string
-	MockBLE          bool
-	WiFiServiceUUID  string
-	WiFiConfigChar   string
-	WiFiStatusChar   string
+	AppName         string
+	Debug           bool
+	Port            int
+	BLENamePrefix   string
+	MockBLE         bool
+	WiFiServiceUUID string
+	WiFiConfigChar  string
+	WiFiStatusChar  string
 
 	// MQTT broker configuration (mirrors Python backend defaults where possible).
-	MQTTEnabled             bool
-	MQTTBrokerHost         string
-	MQTTBrokerPort         int
-	MQTTUsername           string
-	MQTTPassword           string
+	MQTTEnabled    bool
+	MQTTBrokerHost string
+	MQTTBrokerPort int
+	MQTTUsername   string
+	MQTTPassword   string
 	// MQTT publish/subscribe topics.
 	// These are not used yet by HTTP endpoints, but they are exposed in /api/config
 	// so the frontend can confirm they are loaded.
 	//
-	// Publish topic supports a placeholder `{device_id}` for future use.
-	MQTTPublishTopic      string
-	MQTTSubscribeTopic    string
+	// MQTTPublishTopic is used for commands and for config (lane/watch) — default stopwatch/{device_id}/cmd.
+	MQTTPublishTopic   string
+	MQTTSubscribeTopic string
 	// MQTTSubscribeHealthTopic subscribes to device heartbeat (default: stopwatch/+/health).
 	MQTTSubscribeHealthTopic string
 	// MQTTSubscribeTimeTopic subscribes to device timing result (default: stopwatch/+/time).
 	MQTTSubscribeTimeTopic string
-	MQTTClientID           string
-	MQTTConnectTimeoutSec  int
+	// MQTTSubscribeRequestTopic subscribes to device LCD request (default: stopwatch/+/lcd/request).
+	MQTTSubscribeRequestTopic string
+	// MQTTPublishResponseTopic publishes the server's answer (default: stopwatch/{device_id}/lcd/response).
+	MQTTPublishResponseTopic string
+	MQTTClientID             string
+	MQTTConnectTimeoutSec    int
+	// MQTTConfigAckTimeoutSec is how long to wait for {"id":"..."} on the cmd topic after publishing config.
+	MQTTConfigAckTimeoutSec int
+	// MQTTCmdPayloadPlain, if true, publishes only the command word (start|stop|reset) for firmware that does not parse JSON.
+	MQTTCmdPayloadPlain bool
 }
 
 // DeviceSummary mirrors app.backend.app.models.DeviceSummary.
@@ -780,6 +812,12 @@ func main() {
 						continue
 					}
 					_, _ = fmt.Fprintf(w, "event: timing\ndata: %s\n\n", b)
+				case "device_rename":
+					b, err := json.Marshal(msg.DeviceRename)
+					if err != nil {
+						continue
+					}
+					_, _ = fmt.Fprintf(w, "event: device_rename\ndata: %s\n\n", b)
 				default:
 					continue
 				}
@@ -791,12 +829,33 @@ func main() {
 	// POST /api/mqtt/devices/{device_id}/{command}
 	// Publishes command payload to stopwatch/{device_id}/cmd (template from MQTT_PUBLISH_TOPIC).
 	// Supported commands: start, stop, reset.
+	// POST /api/mqtt/devices/{device_id}/config publishes {"id","lane","watch"} to stopwatch/{device_id}/cmd (same as MQTT_PUBLISH_TOPIC).
 	mux.HandleFunc("/api/mqtt/devices/", func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/mqtt/devices/") {
 			http.NotFound(w, r)
 			return
 		}
-		if !(strings.HasSuffix(r.URL.Path, "/start") || strings.HasSuffix(r.URL.Path, "/stop") || strings.HasSuffix(r.URL.Path, "/reset")) {
+		trim := strings.TrimPrefix(r.URL.Path, "/api/mqtt/devices/")
+		trim = strings.TrimSuffix(trim, "/")
+		if deviceID, ok := strings.CutSuffix(trim, "/request-response"); ok {
+			deviceID = strings.TrimSpace(deviceID)
+			if deviceID == "" {
+				http.Error(w, "missing device_id in path", http.StatusBadRequest)
+				return
+			}
+			switch r.Method {
+			case http.MethodGet:
+				getRequestResponseProfile(w, deviceID)
+				return
+			case http.MethodPut:
+				putRequestResponseProfile(w, r, deviceID)
+				return
+			default:
+				methodNotAllowed(w)
+				return
+			}
+		}
+		if !(strings.HasSuffix(r.URL.Path, "/start") || strings.HasSuffix(r.URL.Path, "/stop") || strings.HasSuffix(r.URL.Path, "/reset") || strings.HasSuffix(r.URL.Path, "/config")) {
 			http.NotFound(w, r)
 			return
 		}
@@ -818,17 +877,105 @@ func main() {
 			http.Error(w, "missing device_id in path", http.StatusBadRequest)
 			return
 		}
+
+		if command == "config" {
+			bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 8192))
+			if err != nil {
+				http.Error(w, "failed to read body", http.StatusBadRequest)
+				return
+			}
+			if len(strings.TrimSpace(string(bodyBytes))) == 0 {
+				http.Error(w, "JSON body with lane and watch is required", http.StatusBadRequest)
+				return
+			}
+			var cfgBody struct {
+				Lane  *int `json:"lane"`
+				Watch *int `json:"watch"`
+			}
+			if err := json.Unmarshal(bodyBytes, &cfgBody); err != nil {
+				http.Error(w, "body must be JSON with lane and watch", http.StatusBadRequest)
+				return
+			}
+			if cfgBody.Lane == nil || cfgBody.Watch == nil {
+				http.Error(w, "lane and watch are required", http.StatusBadRequest)
+				return
+			}
+			out := map[string]any{
+				"id":    deviceID,
+				"lane":  *cfgBody.Lane,
+				"watch": *cfgBody.Watch,
+			}
+			payloadBytes, err := json.Marshal(out)
+			if err != nil {
+				http.Error(w, "failed to build config payload", http.StatusInternalServerError)
+				return
+			}
+			payload := string(payloadBytes)
+			topic := buildMQTTTopic(cfg.MQTTPublishTopic, deviceID, "stopwatch/{device_id}/cmd")
+			if topic == "" {
+				http.Error(w, "invalid device_id for mqtt topic", http.StatusBadRequest)
+				return
+			}
+			previousID := deviceID
+			ackTimeout := time.Duration(cfg.MQTTConfigAckTimeoutSec) * time.Second
+			if ackTimeout <= 0 {
+				ackTimeout = 15 * time.Second
+			}
+			ackID, ackOK, err := publishConfigAndWaitForAck(topic, payload, ackTimeout)
+			if err != nil {
+				log.Printf("mqtt config publish/handshake failed (topic=%s): %v", topic, err)
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			resolvedID := previousID
+			if ackOK && ackID != "" {
+				resolvedID = ackID
+				if ackID != previousID {
+					migrateDeviceID(previousID, ackID)
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success":            true,
+				"device_id":          resolvedID,
+				"previous_device_id": previousID,
+				"config_ack":         ackOK && ackID != "",
+				"topic":              topic,
+				"message":            payload,
+			})
+			return
+		}
+
 		if command != "start" && command != "stop" && command != "reset" {
 			http.Error(w, "unsupported command", http.StatusBadRequest)
 			return
 		}
 
-		topic := buildPublishTopic(cfg.MQTTPublishTopic, deviceID)
-		if err := publishMQTTMessage(topic, command); err != nil {
+		var payload string
+		if cfg.MQTTCmdPayloadPlain {
+			payload = command
+		} else {
+			cmdPayload := map[string]any{
+				"id":  deviceID,
+				"cmd": command,
+			}
+			payloadBytes, err := json.Marshal(cmdPayload)
+			if err != nil {
+				http.Error(w, "failed to build command payload", http.StatusInternalServerError)
+				return
+			}
+			payload = string(payloadBytes)
+		}
+		topic := buildMQTTTopic(cfg.MQTTPublishTopic, deviceID, "stopwatch/{device_id}/cmd")
+		if topic == "" {
+			http.Error(w, "invalid device_id for mqtt topic", http.StatusBadRequest)
+			return
+		}
+		if err := publishMQTTMessage(topic, payload); err != nil {
 			log.Printf("mqtt publish failed (topic=%s): %v", topic, err)
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
+		log.Printf("mqtt cmd published topic=%s payload=%s", topic, payload)
 
 		switch command {
 		case "start":
@@ -844,7 +991,7 @@ func main() {
 			"success":   true,
 			"device_id": deviceID,
 			"topic":     topic,
-			"message":   command,
+			"message":   payload,
 		})
 	})
 
@@ -883,45 +1030,53 @@ func loadConfig() (*Config, error) {
 		WiFiConfigChar:  getEnv("WIFI_CONFIG_CHAR_UUID", "12345678-1234-5678-1234-56789abcdef1"),
 		WiFiStatusChar:  getEnv("WIFI_STATUS_CHAR_UUID", "12345678-1234-5678-1234-56789abcdef2"),
 
-		MQTTEnabled:            getEnvAsBool("MQTT_ENABLED", true),
-		MQTTBrokerHost:        getEnv("MQTT_BROKER_HOST", "localhost"),
-		MQTTBrokerPort:        getEnvAsInt("MQTT_BROKER_PORT", 1883),
-		MQTTUsername:          getEnv("MQTT_USERNAME", ""),
-		MQTTPassword:          getEnv("MQTT_PASSWORD", ""),
+		MQTTEnabled:    getEnvAsBool("MQTT_ENABLED", true),
+		MQTTBrokerHost: getEnv("MQTT_BROKER_HOST", "localhost"),
+		MQTTBrokerPort: getEnvAsInt("MQTT_BROKER_PORT", 1883),
+		MQTTUsername:   getEnv("MQTT_USERNAME", ""),
+		MQTTPassword:   getEnv("MQTT_PASSWORD", ""),
 		// Defaults align with firmware's `wifi_mqtt_topic_device(..., "cmd"/"data")`:
 		// publish -> stopwatch/<device_id>/cmd
 		// subscribe -> stopwatch/+/data
-		MQTTPublishTopic:      getEnv("MQTT_PUBLISH_TOPIC", "stopwatch/{device_id}/cmd"),
-		MQTTSubscribeTopic:    getEnv("MQTT_SUBSCRIBE_TOPIC", "stopwatch/+/data"),
-		MQTTSubscribeHealthTopic: getEnv("MQTT_SUBSCRIBE_HEALTH_TOPIC", "stopwatch/+/health"),
-		MQTTSubscribeTimeTopic: getEnv("MQTT_SUBSCRIBE_TIME_TOPIC", "stopwatch/+/time"),
-		MQTTClientID:          getEnv("MQTT_CLIENT_ID", ""),
-		MQTTConnectTimeoutSec: getEnvAsInt("MQTT_CONNECT_TIMEOUT_SEC", 5),
+		MQTTPublishTopic:          getEnv("MQTT_PUBLISH_TOPIC", "stopwatch/{device_id}/cmd"),
+		MQTTSubscribeTopic:        getEnv("MQTT_SUBSCRIBE_TOPIC", "stopwatch/+/data"),
+		MQTTSubscribeHealthTopic:  getEnv("MQTT_SUBSCRIBE_HEALTH_TOPIC", "stopwatch/+/health"),
+		MQTTSubscribeTimeTopic:    getEnv("MQTT_SUBSCRIBE_TIME_TOPIC", "stopwatch/+/time"),
+		MQTTSubscribeRequestTopic: getEnv("MQTT_SUBSCRIBE_REQUEST_TOPIC", "stopwatch/+/lcd/request"),
+		MQTTPublishResponseTopic:  getEnv("MQTT_PUBLISH_RESPONSE_TOPIC", "stopwatch/{device_id}/lcd/response"),
+		MQTTClientID:              getEnv("MQTT_CLIENT_ID", ""),
+		MQTTConnectTimeoutSec:     getEnvAsInt("MQTT_CONNECT_TIMEOUT_SEC", 5),
+		MQTTConfigAckTimeoutSec:   getEnvAsInt("MQTT_CONFIG_ACK_TIMEOUT_SEC", 15),
+		MQTTCmdPayloadPlain:       getEnvAsBool("MQTT_CMD_PAYLOAD_PLAIN", false),
 	}
 	return cfg, nil
 }
 
 func configForDisplay(cfg *Config) map[string]any {
 	return map[string]any{
-		"app_name":             cfg.AppName,
-		"debug":                cfg.Debug,
-		"port":                 cfg.Port,
-		"ble_name_prefix":      cfg.BLENamePrefix,
-		"mock_ble":             cfg.MockBLE,
-		"wifi_service_uuid":    cfg.WiFiServiceUUID,
+		"app_name":              cfg.AppName,
+		"debug":                 cfg.Debug,
+		"port":                  cfg.Port,
+		"ble_name_prefix":       cfg.BLENamePrefix,
+		"mock_ble":              cfg.MockBLE,
+		"wifi_service_uuid":     cfg.WiFiServiceUUID,
 		"wifi_config_char_uuid": cfg.WiFiConfigChar,
 		"wifi_status_char_uuid": cfg.WiFiStatusChar,
 
-		"mqtt_enabled":      cfg.MQTTEnabled,
-		"mqtt_broker_host": cfg.MQTTBrokerHost,
-		"mqtt_broker_port": cfg.MQTTBrokerPort,
-		"mqtt_publish_topic":  cfg.MQTTPublishTopic,
-		"mqtt_subscribe_topic": cfg.MQTTSubscribeTopic,
-		"mqtt_subscribe_health_topic": cfg.MQTTSubscribeHealthTopic,
-		"mqtt_subscribe_time_topic": cfg.MQTTSubscribeTimeTopic,
-		"mqtt_username":    cfg.MQTTUsername,
+		"mqtt_enabled":                 cfg.MQTTEnabled,
+		"mqtt_broker_host":             cfg.MQTTBrokerHost,
+		"mqtt_broker_port":             cfg.MQTTBrokerPort,
+		"mqtt_publish_topic":           cfg.MQTTPublishTopic,
+		"mqtt_subscribe_topic":         cfg.MQTTSubscribeTopic,
+		"mqtt_subscribe_health_topic":  cfg.MQTTSubscribeHealthTopic,
+		"mqtt_subscribe_time_topic":    cfg.MQTTSubscribeTimeTopic,
+		"mqtt_subscribe_request_topic": cfg.MQTTSubscribeRequestTopic,
+		"mqtt_publish_response_topic":  cfg.MQTTPublishResponseTopic,
+		"mqtt_username":                cfg.MQTTUsername,
+		"mqtt_config_ack_timeout_sec":  cfg.MQTTConfigAckTimeoutSec,
+		"mqtt_cmd_payload_plain":       cfg.MQTTCmdPayloadPlain,
 		// Intentionally omit password (secrets).
-		"_go_backend":          true,
+		"_go_backend": true,
 	}
 }
 
@@ -961,6 +1116,8 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 				handleHeartbeatMQTTMessage(logger, topic, payload)
 			case strings.HasSuffix(topic, "/time"):
 				handleTimeMQTTMessage(logger, topic, payload)
+			case strings.HasSuffix(topic, "/lcd/request"):
+				handleRequestMQTTMessage(logger, cfg, topic, payload)
 			default:
 				logger.Printf("Ignoring MQTT message on unexpected topic: %s", topic)
 			}
@@ -1009,7 +1166,7 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 func mqttSubscribeTopics(cfg *Config) []string {
 	seen := make(map[string]struct{})
 	var out []string
-	for _, t := range []string{cfg.MQTTSubscribeTopic, cfg.MQTTSubscribeHealthTopic, cfg.MQTTSubscribeTimeTopic} {
+	for _, t := range []string{cfg.MQTTSubscribeTopic, cfg.MQTTSubscribeHealthTopic, cfg.MQTTSubscribeTimeTopic, cfg.MQTTSubscribeRequestTopic} {
 		t = strings.TrimSpace(t)
 		if t == "" {
 			continue
@@ -1208,6 +1365,55 @@ func handleTimeMQTTMessage(logger *log.Logger, topic, payload string) {
 	publishTimingEvent(ev)
 }
 
+func handleRequestMQTTMessage(logger *log.Logger, cfg *Config, topic, payload string) {
+	deviceID, ok := parseDeviceIDFromLCDTopic(topic, "request")
+	if !ok {
+		logger.Printf("Ignoring MQTT request with unexpected topic: %s", topic)
+		return
+	}
+
+	payload = strings.TrimSpace(payload)
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		logger.Printf("Ignoring invalid request JSON (topic=%s): %v", topic, err)
+		return
+	}
+	lane := 0
+	if v, ok := raw["lane"]; ok {
+		if n, ok := intFromJSONAny(v); ok {
+			lane = n
+		}
+	}
+
+	requestProfileMu.RLock()
+	prof := requestProfileByDevice[deviceID]
+	requestProfileMu.RUnlock()
+
+	out := map[string]any{
+		"lane":         lane,
+		"athlete_name": prof.AthleteName,
+		"event_label":  prof.EventLabel,
+		"eid":          prof.Eid,
+		"mid":          prof.Mid,
+		"heart":        prof.Heart,
+	}
+	respBytes, err := json.Marshal(out)
+	if err != nil {
+		logger.Printf("MQTT response marshal failed: %v", err)
+		return
+	}
+	respTopic := buildMQTTTopic(cfg.MQTTPublishResponseTopic, deviceID, "stopwatch/{device_id}/lcd/response")
+	if respTopic == "" {
+		logger.Printf("Missing device_id for MQTT response topic")
+		return
+	}
+	if err := publishMQTTMessage(respTopic, string(respBytes)); err != nil {
+		logger.Printf("mqtt response publish failed (topic=%s): %v", respTopic, err)
+		return
+	}
+	logger.Printf("MQTT request answered device=%s lane=%d -> %s", deviceID, lane, respTopic)
+}
+
 func formatDurationToWatch(ms int64) string {
 	if ms < 0 {
 		ms = 0
@@ -1339,6 +1545,164 @@ func clearDeviceLastElapsed(deviceID string) {
 	serverStopMu.Unlock()
 }
 
+// migrateDeviceID moves per-device server and hub state when the canonical id changes after config ACK.
+func migrateDeviceID(oldID, newID string) {
+	if oldID == "" || newID == "" || oldID == newID {
+		return
+	}
+	stopServerStopwatch(oldID)
+
+	serverStopMu.Lock()
+	if ms, ok := deviceLastElapsedMs[oldID]; ok {
+		deviceLastElapsedMs[newID] = ms
+		delete(deviceLastElapsedMs, oldID)
+	}
+	serverStopMu.Unlock()
+
+	realtimeHub.mu.Lock()
+	if ev, ok := realtimeHub.latest[oldID]; ok {
+		ev.DeviceID = newID
+		realtimeHub.latest[newID] = ev
+		delete(realtimeHub.latest, oldID)
+	}
+	if ev, ok := realtimeHub.latestHealth[oldID]; ok {
+		ev.DeviceID = newID
+		realtimeHub.latestHealth[newID] = ev
+		delete(realtimeHub.latestHealth, oldID)
+	}
+	if ev, ok := realtimeHub.latestTiming[oldID]; ok {
+		ev.DeviceID = newID
+		realtimeHub.latestTiming[newID] = ev
+		delete(realtimeHub.latestTiming, oldID)
+	}
+	if ev, ok := realtimeHub.latestServerTick[oldID]; ok {
+		ev.DeviceID = newID
+		realtimeHub.latestServerTick[newID] = ev
+		delete(realtimeHub.latestServerTick, oldID)
+	}
+	realtimeHub.mu.Unlock()
+
+	requestProfileMu.Lock()
+	if p, ok := requestProfileByDevice[oldID]; ok {
+		requestProfileByDevice[newID] = p
+		delete(requestProfileByDevice, oldID)
+	}
+	requestProfileMu.Unlock()
+
+	publishDeviceRenameEvent(oldID, newID)
+	log.Printf("device id migrated after config ack: %s -> %s", oldID, newID)
+}
+
+func publishDeviceRenameEvent(previousID, newID string) {
+	if previousID == "" || newID == "" || previousID == newID {
+		return
+	}
+	ev := DeviceRenameEvent{PreviousDeviceID: previousID, DeviceID: newID}
+	msg := streamEvent{Kind: "device_rename", DeviceRename: ev}
+	realtimeHub.mu.Lock()
+	for ch := range realtimeHub.clients {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+	realtimeHub.mu.Unlock()
+}
+
+func parseConfigAckID(payload, sentPayload string) (string, bool) {
+	p := strings.TrimSpace(payload)
+	if p == strings.TrimSpace(sentPayload) {
+		return "", false
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(p), &m); err != nil {
+		return "", false
+	}
+	raw, ok := m["id"]
+	if !ok {
+		return "", false
+	}
+	var id string
+	switch v := raw.(type) {
+	case string:
+		id = strings.TrimSpace(v)
+	default:
+		id = strings.TrimSpace(fmt.Sprint(v))
+	}
+	if id == "" {
+		return "", false
+	}
+	return id, true
+}
+
+func drainStringChan(ch chan string) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// publishConfigAndWaitForAck subscribes at QoS 1 to the same cmd topic, publishes the config payload (QoS 1),
+// then waits for a distinct JSON message containing a non-empty "id" (device ACK). ackOK is false on timeout.
+func publishConfigAndWaitForAck(topic, sentPayload string, timeout time.Duration) (ackID string, ackOK bool, err error) {
+	if mqttClient == nil {
+		return "", false, fmt.Errorf("mqtt client is not initialized")
+	}
+	if !mqttClient.IsConnected() {
+		return "", false, fmt.Errorf("mqtt client is not connected")
+	}
+
+	configAckMu.Lock()
+	defer configAckMu.Unlock()
+
+	msgCh := make(chan string, 2)
+	handler := func(_ mqtt.Client, msg mqtt.Message) {
+		p := string(msg.Payload())
+		if id, ok := parseConfigAckID(p, sentPayload); ok {
+			select {
+			case msgCh <- id:
+			default:
+			}
+		}
+	}
+
+	subTok := mqttClient.Subscribe(topic, 1, handler)
+	if !subTok.WaitTimeout(5 * time.Second) {
+		return "", false, fmt.Errorf("mqtt subscribe timeout for %s", topic)
+	}
+	if err := subTok.Error(); err != nil {
+		return "", false, fmt.Errorf("mqtt subscribe error: %w", err)
+	}
+	defer func() {
+		unsub := mqttClient.Unsubscribe(topic)
+		if !unsub.WaitTimeout(3 * time.Second) {
+			log.Printf("mqtt unsubscribe timeout for %s", topic)
+			return
+		}
+		if err := unsub.Error(); err != nil {
+			log.Printf("mqtt unsubscribe error for %s: %v", topic, err)
+		}
+	}()
+
+	drainStringChan(msgCh)
+	time.Sleep(50 * time.Millisecond)
+	drainStringChan(msgCh)
+
+	if err := publishMQTTMessage(topic, sentPayload); err != nil {
+		return "", false, err
+	}
+
+	select {
+	case ackID = <-msgCh:
+		return ackID, true, nil
+	case <-time.After(timeout):
+		return "", false, nil
+	}
+}
+
 func parseDeviceIDFromTopic(topic, suffix string) (string, bool) {
 	// Expected pattern: stopwatch/{device_id}/{suffix}
 	parts := strings.Split(topic, "/")
@@ -1346,6 +1710,22 @@ func parseDeviceIDFromTopic(topic, suffix string) (string, bool) {
 		return "", false
 	}
 	if parts[0] != "stopwatch" || parts[2] != suffix {
+		return "", false
+	}
+	deviceID := strings.TrimSpace(parts[1])
+	if deviceID == "" {
+		return "", false
+	}
+	return deviceID, true
+}
+
+// parseDeviceIDFromLCDTopic parses stopwatch/{device_id}/lcd/{suffix} (suffix is "request" or "response").
+func parseDeviceIDFromLCDTopic(topic, suffix string) (string, bool) {
+	parts := strings.Split(topic, "/")
+	if len(parts) != 4 {
+		return "", false
+	}
+	if parts[0] != "stopwatch" || parts[2] != "lcd" || parts[3] != suffix {
 		return "", false
 	}
 	deviceID := strings.TrimSpace(parts[1])
@@ -1472,15 +1852,46 @@ func latestTimingSnapshot() []DeviceTimeEvent {
 	return out
 }
 
-func buildPublishTopic(template, deviceID string) string {
+func getRequestResponseProfile(w http.ResponseWriter, deviceID string) {
+	requestProfileMu.RLock()
+	prof, ok := requestProfileByDevice[deviceID]
+	requestProfileMu.RUnlock()
+	if !ok {
+		prof = RequestResponseProfile{}
+	}
+	writeJSON(w, http.StatusOK, prof)
+}
+
+func putRequestResponseProfile(w http.ResponseWriter, r *http.Request, deviceID string) {
+	var prof RequestResponseProfile
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&prof); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	requestProfileMu.Lock()
+	requestProfileByDevice[deviceID] = prof
+	requestProfileMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "device_id": deviceID})
+}
+
+// buildMQTTTopic resolves a template with {device_id}. If the template is empty or missing the
+// placeholder, defaultTemplate (must contain "{device_id}") is used so publishes always target
+// a per-device topic (misconfigured MQTT_PUBLISH_TOPIC previously produced a single shared topic).
+func buildMQTTTopic(template, deviceID, defaultTemplate string) string {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return ""
+	}
 	topic := strings.TrimSpace(template)
 	if topic == "" {
-		return fmt.Sprintf("stopwatch/%s/cmd", deviceID)
+		topic = defaultTemplate
 	}
 	if strings.Contains(topic, "{device_id}") {
 		return strings.ReplaceAll(topic, "{device_id}", deviceID)
 	}
-	return topic
+	out := strings.ReplaceAll(strings.TrimSpace(defaultTemplate), "{device_id}", deviceID)
+	log.Printf("mqtt: topic template %q has no {device_id} placeholder; using %q", topic, out)
+	return out
 }
 
 func publishMQTTMessage(topic, payload string) error {
@@ -1500,7 +1911,6 @@ func publishMQTTMessage(topic, payload string) error {
 	}
 	return nil
 }
-
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1544,4 +1954,3 @@ func getEnvAsInt(key string, defaultVal int) int {
 	}
 	return i
 }
-

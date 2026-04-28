@@ -71,7 +71,7 @@ Base URL (default): `http://localhost:8000`
 - **`event: server_tick`** — JSON while the server stopwatch is running:
   - `device_id`, `display`, `elapsed_ms`, `received_at`.
 - **`event: timing`** — JSON from `stopwatch/{device_id}/time` (device-reported result after stop/reset), e.g.:
-  - `time_ms`, `display`, `id`, `type`, `mid`, `eid`, `heart`, `payload`, `topic`, `received_at`.  
+  - `time_ms`, `display`, `id`, `type`, `mid`, `eid`, `heat`, `payload`, `topic`, `received_at`.  
   - String fields like `"time":"3453"` are parsed as milliseconds.  
   - On receipt, the server updates the **resume** value for the next **start** to match the device.
 

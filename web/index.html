@@ -157,6 +157,13 @@
       padding: 8px 10px;
       width: 72px;
     }
+    .configRow select {
+      background: #0b1220;
+      border: 1px solid #334155;
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
     .configRow label {
       font-size: 12px;
     }
@@ -165,28 +172,33 @@
       font-size: 12px;
       padding: 6px 10px;
     }
-    .adminGrid {
-      display: grid;
-      grid-template-columns: auto 1fr;
-      gap: 6px 10px;
-      align-items: center;
+    .manualMsg {
       font-size: 12px;
+      color: #94a3b8;
     }
-    .adminGrid input[type="text"],
-    .adminGrid input[type="number"] {
+    .broadcastPanel {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      background: #0b1220;
+      display: grid;
+      gap: 8px;
+    }
+    .broadcastGrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+      align-items: center;
+    }
+    .broadcastGrid input,
+    .broadcastGrid select {
       background: #0b1220;
       border: 1px solid #334155;
       color: #e2e8f0;
       border-radius: 8px;
       padding: 8px 10px;
       min-width: 0;
-    }
-    .adminGrid label {
-      color: #94a3b8;
-    }
-    .manualMsg {
-      font-size: 12px;
-      color: #94a3b8;
     }
   </style>
 </head>
@@ -199,15 +211,41 @@
       <button id="addWatchBtn">Add Watch</button>
       <span id="manualAddMsg" class="manualMsg"></span>
     </div>
+    <div class="broadcastPanel">
+      <div><strong>Broadcast race state</strong> <span class="mono">brain/race/state</span></div>
+      <div class="broadcastGrid">
+        <input id="raceEidInput" type="number" step="1" value="1" placeholder="eid" />
+        <input id="raceNameInput" type="text" value="100 Free" placeholder="name" />
+        <input id="raceHeatInput" type="number" step="1" value="1" placeholder="heat" />
+        <select id="raceActionInput">
+          <option value="0" selected>0 (next_heat)</option>
+          <option value="1">1 (next_event)</option>
+          <option value="2">2 (meet_started)</option>
+        </select>
+      </div>
+      <div class="configRow" style="margin-top: 0">
+        <button id="publishRaceStateBtn" type="button">Publish race state</button>
+        <span id="raceBroadcastStatus" class="widgetStatus"></span>
+      </div>
+    </div>
     <div class="subtle">Widgets appear when a device sends stopwatch data or heartbeat on MQTT (e.g. <span class="mono">stopwatch/+/health</span>).</div>
     <div id="widgets" class="widgets"></div>
   </div>
 
   <script>
+    const HEARTBEAT_STALE_MS = 70 * 1000;
+    const HEARTBEAT_SWEEP_MS = 5 * 1000;
+
     const statusEl = document.getElementById("status");
     const manualDeviceIdEl = document.getElementById("manualDeviceId");
     const addWatchBtn = document.getElementById("addWatchBtn");
     const manualAddMsgEl = document.getElementById("manualAddMsg");
+    const raceEidInput = document.getElementById("raceEidInput");
+    const raceNameInput = document.getElementById("raceNameInput");
+    const raceHeatInput = document.getElementById("raceHeatInput");
+    const raceActionInput = document.getElementById("raceActionInput");
+    const publishRaceStateBtn = document.getElementById("publishRaceStateBtn");
+    const raceBroadcastStatus = document.getElementById("raceBroadcastStatus");
     const widgetsEl = document.getElementById("widgets");
     const widgetsByDeviceId = new Map();
     /** Superseded id -> canonical id (after config ACK rename). Keeps MQTT events on old id from spawning a second card. */
@@ -269,7 +307,7 @@
             <button type="button" data-role="removeBtn" title="Remove this device card">Remove</button>
           </div>
         </div>
-        <div class="meta subtle" data-role="friendlyNameRow" style="display:none">Name: <span class="mono" data-role="friendlyName">-</span></div>
+        <div class="meta subtle" data-role="friendlyNameRow">Name: <span class="mono" data-role="friendlyName">Unpaired Device</span></div>
         <div class="watch mono" data-role="watch">00:00:00.00</div>
         <div class="meta">
           <div>Data topic: <span class="mono" data-role="topic">-</span></div>
@@ -279,7 +317,7 @@
           <h3>Device time (MQTT)</h3>
           <div>Time topic: <span class="mono" data-role="timeTopic">-</span></div>
           <div>time (ms): <span class="mono" data-role="timeMs">-</span></div>
-          <div>type / mid / eid / heart: <span class="mono" data-role="timeFields">-</span></div>
+          <div>type / mid / eid / heat: <span class="mono" data-role="timeFields">-</span></div>
           <pre class="healthRaw mono" data-role="timeRaw"></pre>
         </div>
         <div class="healthBlock" data-role="healthBlock">
@@ -302,36 +340,20 @@
           <input type="number" min="0" step="1" value="3" data-role="laneInput" />
           <label>Watch #</label>
           <input type="number" min="0" step="1" value="2" data-role="watchInput" />
+          <label>Role</label>
+          <select data-role="roleInput">
+            <option value="0" selected>0 (lane_timer)</option>
+            <option value="1">1 (head_timer)</option>
+          </select>
           <button type="button" data-role="configBtn">Send config</button>
-        </div>
-        <div class="healthBlock" data-role="requestProfileBlock">
-          <h3>Request response (admin)</h3>
-          <p class="subtle" style="margin: 0 0 8px">
-            When the device publishes to <span class="mono">stopwatch/{device_id}/lcd/request</span>, the server replies on
-            <span class="mono">stopwatch/{device_id}/lcd/response</span> using the values below (lane comes from the device request).
-          </p>
-          <div class="adminGrid">
-            <label>Athlete name</label>
-            <input type="text" data-role="athleteNameInput" placeholder="M. Phelps" autocomplete="off" />
-            <label>Event label</label>
-            <input type="text" data-role="eventLabelInput" placeholder="100 Free" autocomplete="off" />
-            <label>eid</label>
-            <input type="number" step="1" value="0" data-role="eidInput" />
-            <label>mid</label>
-            <input type="number" step="1" value="0" data-role="midInput" />
-            <label>heart</label>
-            <input type="number" step="1" value="0" data-role="heartInput" />
-          </div>
-          <div class="configRow" style="margin-top: 10px">
-            <button type="button" data-role="saveProfileBtn">Save response profile</button>
-            <span class="widgetStatus" data-role="profileStatusEl"></span>
-          </div>
         </div>
       `;
 
       const refs = {
         root,
         deviceId,
+        createdAtMs: Date.now(),
+        lastHeartbeatAtMs: null,
         serverRunning: false,
         watchEl: root.querySelector('[data-role="watch"]'),
         topicEl: root.querySelector('[data-role="topic"]'),
@@ -356,15 +378,9 @@
         resetBtn: root.querySelector('[data-role="resetBtn"]'),
         laneInput: root.querySelector('[data-role="laneInput"]'),
         watchInput: root.querySelector('[data-role="watchInput"]'),
+        roleInput: root.querySelector('[data-role="roleInput"]'),
         configBtn: root.querySelector('[data-role="configBtn"]'),
         removeBtn: root.querySelector('[data-role="removeBtn"]'),
-        athleteNameInput: root.querySelector('[data-role="athleteNameInput"]'),
-        eventLabelInput: root.querySelector('[data-role="eventLabelInput"]'),
-        eidInput: root.querySelector('[data-role="eidInput"]'),
-        midInput: root.querySelector('[data-role="midInput"]'),
-        heartInput: root.querySelector('[data-role="heartInput"]'),
-        saveProfileBtn: root.querySelector('[data-role="saveProfileBtn"]'),
-        profileStatusEl: root.querySelector('[data-role="profileStatusEl"]'),
       };
 
       refs.removeBtn.addEventListener("click", () => removeDeviceWidget(refs));
@@ -372,11 +388,9 @@
       refs.stopBtn.addEventListener("click", () => sendCommand(refs, "stop"));
       refs.resetBtn.addEventListener("click", () => sendCommand(refs, "reset"));
       refs.configBtn.addEventListener("click", () => sendDeviceConfig(refs));
-      refs.saveProfileBtn.addEventListener("click", () => saveRequestProfile(refs));
 
       widgetsEl.appendChild(root);
       widgetsByDeviceId.set(deviceId, refs);
-      loadRequestProfile(refs);
       return refs;
     }
 
@@ -390,6 +404,14 @@
         return existing;
       }
       return createWidget(canonical);
+    }
+
+    function getExistingWidget(deviceId) {
+      const canonical = resolveCanonicalDeviceId(deviceId);
+      if (!canonical) {
+        return null;
+      }
+      return widgetsByDeviceId.get(canonical) || null;
     }
 
     function addWatchManually() {
@@ -416,7 +438,6 @@
       refs.stopBtn.disabled = disabled;
       refs.resetBtn.disabled = disabled;
       refs.configBtn.disabled = disabled;
-      refs.saveProfileBtn.disabled = disabled;
     }
 
     /**
@@ -467,6 +488,22 @@
       refs.root.remove();
     }
 
+    function sweepStaleHeartbeatWidgets() {
+      const now = Date.now();
+      for (const refs of [...widgetsByDeviceId.values()]) {
+        const lastHb = refs.lastHeartbeatAtMs;
+        if (lastHb === null || lastHb === undefined) {
+          if (now - refs.createdAtMs > HEARTBEAT_STALE_MS) {
+            removeDeviceWidget(refs);
+          }
+          continue;
+        }
+        if (now - lastHb > HEARTBEAT_STALE_MS) {
+          removeDeviceWidget(refs);
+        }
+      }
+    }
+
     const stream = new EventSource("/api/mqtt/stream");
 
     stream.addEventListener("ready", () => {
@@ -479,10 +516,6 @@
         const prev = (msg.previous_device_id || "").trim();
         const next = (msg.device_id || "").trim();
         applyDeviceRenamed(prev, next);
-        const r = widgetsByDeviceId.get(next);
-        if (r) {
-          loadRequestProfile(r);
-        }
         statusEl.textContent = "Live stream connected";
       } catch (err) {
         statusEl.textContent = "Received malformed device_rename payload";
@@ -490,9 +523,13 @@
     });
 
     function applyHeartbeatToWidget(refs, msg) {
+      refs.lastHeartbeatAtMs = Date.now();
       if (msg.id) {
         refs.friendlyNameRowEl.style.display = "";
         refs.friendlyNameEl.textContent = msg.id;
+      } else {
+        refs.friendlyNameRowEl.style.display = "";
+        refs.friendlyNameEl.textContent = "Unpaired Device";
       }
       refs.batEl.textContent =
         msg.bat !== undefined && msg.bat !== null ? String(msg.bat) : "-";
@@ -520,7 +557,8 @@
         if (!deviceId) {
           return;
         }
-        const refs = getOrCreateWidget(deviceId);
+        // Only show devices that are already known by heartbeat.
+        const refs = getExistingWidget(deviceId);
         if (!refs) {
           return;
         }
@@ -545,7 +583,8 @@
         if (!deviceId) {
           return;
         }
-        const refs = getOrCreateWidget(deviceId);
+        // Only show devices that are already known by heartbeat.
+        const refs = getExistingWidget(deviceId);
         if (!refs) {
           return;
         }
@@ -570,7 +609,7 @@
           msg.type !== undefined && msg.type !== null ? `type=${msg.type}` : null,
           msg.mid !== undefined && msg.mid !== null ? `mid=${msg.mid}` : null,
           msg.eid !== undefined && msg.eid !== null ? `eid=${msg.eid}` : null,
-          msg.heart !== undefined && msg.heart !== null ? `heart=${msg.heart}` : null,
+          msg.heat !== undefined && msg.heat !== null ? `heat=${msg.heat}` : null,
         ].filter(Boolean);
         refs.timeFieldsEl.textContent = parts.length ? parts.join(", ") : "-";
         if (msg.payload && typeof msg.payload === "object") {
@@ -581,6 +620,9 @@
         if (msg.id) {
           refs.friendlyNameRowEl.style.display = "";
           refs.friendlyNameEl.textContent = msg.id;
+        } else {
+          refs.friendlyNameRowEl.style.display = "";
+          refs.friendlyNameEl.textContent = "Unpaired Device";
         }
         statusEl.textContent = "Live stream connected";
       } catch (err) {
@@ -595,7 +637,8 @@
         if (!deviceId) {
           return;
         }
-        const refs = getOrCreateWidget(deviceId);
+        // Only show devices that are already known by heartbeat.
+        const refs = getExistingWidget(deviceId);
         if (!refs) {
           return;
         }
@@ -647,86 +690,67 @@
       }
     };
 
-    async function loadRequestProfile(refs) {
-      try {
-        const res = await fetch(
-          `/api/mqtt/devices/${encodeURIComponent(refs.deviceId)}/request-response`
-        );
-        if (!res.ok) {
-          return;
-        }
-        const data = await res.json();
-        refs.athleteNameInput.value =
-          data.athlete_name !== undefined && data.athlete_name !== null
-            ? String(data.athlete_name)
-            : "";
-        refs.eventLabelInput.value =
-          data.event_label !== undefined && data.event_label !== null
-            ? String(data.event_label)
-            : "";
-        refs.eidInput.value =
-          data.eid !== undefined && data.eid !== null ? String(data.eid) : "0";
-        refs.midInput.value =
-          data.mid !== undefined && data.mid !== null ? String(data.mid) : "0";
-        refs.heartInput.value =
-          data.heart !== undefined && data.heart !== null ? String(data.heart) : "0";
-      } catch (err) {
-        /* ignore */
-      }
-    }
+    setInterval(sweepStaleHeartbeatWidgets, HEARTBEAT_SWEEP_MS);
 
-    async function saveRequestProfile(refs) {
-      const deviceId = refs.deviceId;
-      refs.profileStatusEl.textContent = "Saving...";
-      refs.saveProfileBtn.disabled = true;
-      const body = {
-        athlete_name: refs.athleteNameInput.value.trim(),
-        event_label: refs.eventLabelInput.value.trim(),
-        eid: parseInt(refs.eidInput.value, 10) || 0,
-        mid: parseInt(refs.midInput.value, 10) || 0,
-        heart: parseInt(refs.heartInput.value, 10) || 0,
-      };
+    async function sendRaceStateBroadcast() {
+      const eid = parseInt((raceEidInput.value || "").trim(), 10);
+      const heat = parseInt((raceHeatInput.value || "").trim(), 10);
+      const action = parseInt((raceActionInput.value || "").trim(), 10);
+      const name = (raceNameInput.value || "").trim();
+      if (!Number.isFinite(eid) || !Number.isFinite(heat) || !Number.isFinite(action) || !name) {
+        raceBroadcastStatus.textContent = "Publish failed: eid/name/heat/action required";
+        return;
+      }
+      if (action < 0 || action > 2) {
+        raceBroadcastStatus.textContent = "Publish failed: action must be 0, 1, or 2";
+        return;
+      }
+
+      publishRaceStateBtn.disabled = true;
+      raceBroadcastStatus.textContent = "Publishing...";
       try {
-        const res = await fetch(
-          `/api/mqtt/devices/${encodeURIComponent(deviceId)}/request-response`,
-          {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
-          }
-        );
+        const res = await fetch("/api/mqtt/broadcast/race-state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ eid, name, heat, action }),
+        });
         if (!res.ok) {
           const text = await res.text();
-          refs.profileStatusEl.textContent = `Save failed: ${text || res.status}`;
+          raceBroadcastStatus.textContent = `Publish failed: ${text || res.status}`;
           return;
         }
-        refs.profileStatusEl.textContent = "Profile saved";
+        raceBroadcastStatus.textContent = "Race state published";
       } catch (err) {
-        refs.profileStatusEl.textContent = "Save failed: network error";
+        raceBroadcastStatus.textContent = "Publish failed: network error";
       } finally {
-        refs.saveProfileBtn.disabled = false;
+        publishRaceStateBtn.disabled = false;
       }
     }
 
     function buildConfigPayload(refs) {
       const laneRaw = refs.laneInput.value.trim();
       const watchRaw = refs.watchInput.value.trim();
-      if (laneRaw === "" || watchRaw === "") {
+      const roleRaw = refs.roleInput.value.trim();
+      if (laneRaw === "" || watchRaw === "" || roleRaw === "") {
         return null;
       }
       const lane = parseInt(laneRaw, 10);
       const watch = parseInt(watchRaw, 10);
-      if (!Number.isFinite(lane) || !Number.isFinite(watch)) {
+      const role = parseInt(roleRaw, 10);
+      if (!Number.isFinite(lane) || !Number.isFinite(watch) || !Number.isFinite(role)) {
         return null;
       }
-      return JSON.stringify({ lane, watch });
+      if (role !== 0 && role !== 1) {
+        return null;
+      }
+      return JSON.stringify({ lane, watch, role });
     }
 
     async function sendDeviceConfig(refs) {
       const payload = buildConfigPayload(refs);
       if (payload === null) {
         refs.actionStatusEl.textContent =
-          "Config failed: enter valid lane and watch numbers";
+          "Config failed: enter valid lane/watch and role (0 or 1)";
         return;
       }
       const deviceId = refs.deviceId;
@@ -746,21 +770,7 @@
           refs.actionStatusEl.textContent = `Config failed: ${text || res.status}`;
           return;
         }
-        const data = await res.json().catch(() => ({}));
-        if (data.device_id && data.previous_device_id && data.device_id !== data.previous_device_id) {
-          renameDeviceWidget(refs, data.device_id);
-        }
-        const profRefs = widgetsByDeviceId.get(data.device_id || deviceId);
-        if (profRefs) {
-          loadRequestProfile(profRefs);
-        }
-        if (data.config_ack === true) {
-          refs.actionStatusEl.textContent = "Config sent (device ack)";
-        } else if (data.config_ack === false) {
-          refs.actionStatusEl.textContent = "Config sent (no device ack yet)";
-        } else {
-          refs.actionStatusEl.textContent = "Config sent";
-        }
+        refs.actionStatusEl.textContent = "Config sent";
       } catch (err) {
         refs.actionStatusEl.textContent = "Config failed: network error";
       } finally {
@@ -792,6 +802,7 @@
     }
 
     addWatchBtn.addEventListener("click", addWatchManually);
+    publishRaceStateBtn.addEventListener("click", sendRaceStateBroadcast);
     manualDeviceIdEl.addEventListener("keydown", (evt) => {
       if (evt.key === "Enter") {
         evt.preventDefault();

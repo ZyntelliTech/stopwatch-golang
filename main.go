@@ -69,7 +69,7 @@ type RequestResponseProfile struct {
 	EventLabel  string `json:"event_label"`
 	Eid         int    `json:"eid"`
 	Mid         int    `json:"mid"`
-	Heart       int    `json:"heart"`
+	Heat        int    `json:"heat"`
 }
 
 type serverRun struct {
@@ -113,7 +113,7 @@ type DeviceTimeEvent struct {
 	Type       int            `json:"type,omitempty"`
 	Mid        int            `json:"mid,omitempty"`
 	Eid        int            `json:"eid,omitempty"`
-	Heart      int            `json:"heart,omitempty"`
+	Heat       int            `json:"heat,omitempty"`
 	ReceivedAt time.Time      `json:"received_at"`
 }
 
@@ -156,8 +156,10 @@ type Config struct {
 	MQTTSubscribeRequestTopic string
 	// MQTTPublishResponseTopic publishes the server's answer (default: stopwatch/{device_id}/lcd/response).
 	MQTTPublishResponseTopic string
-	MQTTClientID             string
-	MQTTConnectTimeoutSec    int
+	// LCDRequestResponseEnabled enables stopwatch/{id}/lcd/request -> /lcd/response handling.
+	LCDRequestResponseEnabled bool
+	MQTTClientID              string
+	MQTTConnectTimeoutSec     int
 	// MQTTConfigAckTimeoutSec is how long to wait for {"id":"..."} on the cmd topic after publishing config.
 	MQTTConfigAckTimeoutSec int
 	// MQTTCmdPayloadPlain, if true, publishes only the command word (start|stop|reset) for firmware that does not parse JSON.
@@ -826,10 +828,68 @@ func main() {
 		}
 	})
 
+	// POST /api/mqtt/broadcast/race-state
+	// Publishes race state JSON to fixed topic brain/race/state.
+	mux.HandleFunc("/api/mqtt/broadcast/race-state", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+			return
+		}
+
+		var body struct {
+			EID    *int   `json:"eid"`
+			Name   string `json:"name"`
+			Heat   *int   `json:"heat"`
+			Action *int   `json:"action"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		if body.EID == nil || body.Heat == nil || body.Action == nil {
+			http.Error(w, "eid, heat, and action are required", http.StatusBadRequest)
+			return
+		}
+		name := strings.TrimSpace(body.Name)
+		if name == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		if *body.Action < 0 || *body.Action > 2 {
+			http.Error(w, "action must be 0 (next_heat), 1 (next_event), or 2 (meet_started)", http.StatusBadRequest)
+			return
+		}
+
+		out := map[string]any{
+			"eid":    *body.EID,
+			"name":   name,
+			"heat":   *body.Heat,
+			"action": *body.Action,
+		}
+		payloadBytes, err := json.Marshal(out)
+		if err != nil {
+			http.Error(w, "failed to build broadcast payload", http.StatusInternalServerError)
+			return
+		}
+		topic := "brain/race/state"
+		payload := string(payloadBytes)
+		if err := publishMQTTMessage(topic, payload); err != nil {
+			log.Printf("mqtt broadcast publish failed (topic=%s): %v", topic, err)
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"topic":   topic,
+			"message": payload,
+		})
+	})
+
 	// POST /api/mqtt/devices/{device_id}/{command}
 	// Publishes command payload to stopwatch/{device_id}/cmd (template from MQTT_PUBLISH_TOPIC).
 	// Supported commands: start, stop, reset.
-	// POST /api/mqtt/devices/{device_id}/config publishes {"id","lane","watch"} to stopwatch/{device_id}/cmd (same as MQTT_PUBLISH_TOPIC).
+	// POST /api/mqtt/devices/{device_id}/config publishes {"lane","watch","role"} to stopwatch/{device_id}/config.
 	mux.HandleFunc("/api/mqtt/devices/", func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/mqtt/devices/") {
 			http.NotFound(w, r)
@@ -838,6 +898,10 @@ func main() {
 		trim := strings.TrimPrefix(r.URL.Path, "/api/mqtt/devices/")
 		trim = strings.TrimSuffix(trim, "/")
 		if deviceID, ok := strings.CutSuffix(trim, "/request-response"); ok {
+			if !cfg.LCDRequestResponseEnabled {
+				http.Error(w, "lcd request/response is disabled", http.StatusNotFound)
+				return
+			}
 			deviceID = strings.TrimSpace(deviceID)
 			if deviceID == "" {
 				http.Error(w, "missing device_id in path", http.StatusBadRequest)
@@ -885,25 +949,30 @@ func main() {
 				return
 			}
 			if len(strings.TrimSpace(string(bodyBytes))) == 0 {
-				http.Error(w, "JSON body with lane and watch is required", http.StatusBadRequest)
+				http.Error(w, "JSON body with lane, watch, and role is required", http.StatusBadRequest)
 				return
 			}
 			var cfgBody struct {
 				Lane  *int `json:"lane"`
 				Watch *int `json:"watch"`
+				Role  *int `json:"role"`
 			}
 			if err := json.Unmarshal(bodyBytes, &cfgBody); err != nil {
-				http.Error(w, "body must be JSON with lane and watch", http.StatusBadRequest)
+				http.Error(w, "body must be JSON with lane, watch, and role", http.StatusBadRequest)
 				return
 			}
-			if cfgBody.Lane == nil || cfgBody.Watch == nil {
-				http.Error(w, "lane and watch are required", http.StatusBadRequest)
+			if cfgBody.Lane == nil || cfgBody.Watch == nil || cfgBody.Role == nil {
+				http.Error(w, "lane, watch, and role are required", http.StatusBadRequest)
+				return
+			}
+			if *cfgBody.Role != 0 && *cfgBody.Role != 1 {
+				http.Error(w, "role must be 0 (lane_timer) or 1 (head_timer)", http.StatusBadRequest)
 				return
 			}
 			out := map[string]any{
-				"id":    deviceID,
 				"lane":  *cfgBody.Lane,
 				"watch": *cfgBody.Watch,
+				"role":  *cfgBody.Role,
 			}
 			payloadBytes, err := json.Marshal(out)
 			if err != nil {
@@ -911,36 +980,21 @@ func main() {
 				return
 			}
 			payload := string(payloadBytes)
-			topic := buildMQTTTopic(cfg.MQTTPublishTopic, deviceID, "stopwatch/{device_id}/cmd")
+			topic := buildMQTTTopic("", deviceID, "stopwatch/{device_id}/config")
 			if topic == "" {
 				http.Error(w, "invalid device_id for mqtt topic", http.StatusBadRequest)
 				return
 			}
-			previousID := deviceID
-			ackTimeout := time.Duration(cfg.MQTTConfigAckTimeoutSec) * time.Second
-			if ackTimeout <= 0 {
-				ackTimeout = 15 * time.Second
-			}
-			ackID, ackOK, err := publishConfigAndWaitForAck(topic, payload, ackTimeout)
-			if err != nil {
-				log.Printf("mqtt config publish/handshake failed (topic=%s): %v", topic, err)
+			if err := publishMQTTMessage(topic, payload); err != nil {
+				log.Printf("mqtt config publish failed (topic=%s): %v", topic, err)
 				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
-			resolvedID := previousID
-			if ackOK && ackID != "" {
-				resolvedID = ackID
-				if ackID != previousID {
-					migrateDeviceID(previousID, ackID)
-				}
-			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"success":            true,
-				"device_id":          resolvedID,
-				"previous_device_id": previousID,
-				"config_ack":         ackOK && ackID != "",
-				"topic":              topic,
-				"message":            payload,
+				"success":   true,
+				"device_id": deviceID,
+				"topic":     topic,
+				"message":   payload,
 			})
 			return
 		}
@@ -1044,6 +1098,7 @@ func loadConfig() (*Config, error) {
 		MQTTSubscribeTimeTopic:    getEnv("MQTT_SUBSCRIBE_TIME_TOPIC", "stopwatch/+/time"),
 		MQTTSubscribeRequestTopic: getEnv("MQTT_SUBSCRIBE_REQUEST_TOPIC", "stopwatch/+/lcd/request"),
 		MQTTPublishResponseTopic:  getEnv("MQTT_PUBLISH_RESPONSE_TOPIC", "stopwatch/{device_id}/lcd/response"),
+		LCDRequestResponseEnabled: getEnvAsBool("LCD_REQUEST_RESPONSE_ENABLED", false),
 		MQTTClientID:              getEnv("MQTT_CLIENT_ID", ""),
 		MQTTConnectTimeoutSec:     getEnvAsInt("MQTT_CONNECT_TIMEOUT_SEC", 5),
 		MQTTConfigAckTimeoutSec:   getEnvAsInt("MQTT_CONFIG_ACK_TIMEOUT_SEC", 15),
@@ -1072,6 +1127,7 @@ func configForDisplay(cfg *Config) map[string]any {
 		"mqtt_subscribe_time_topic":    cfg.MQTTSubscribeTimeTopic,
 		"mqtt_subscribe_request_topic": cfg.MQTTSubscribeRequestTopic,
 		"mqtt_publish_response_topic":  cfg.MQTTPublishResponseTopic,
+		"lcd_request_response_enabled": cfg.LCDRequestResponseEnabled,
 		"mqtt_username":                cfg.MQTTUsername,
 		"mqtt_config_ack_timeout_sec":  cfg.MQTTConfigAckTimeoutSec,
 		"mqtt_cmd_payload_plain":       cfg.MQTTCmdPayloadPlain,
@@ -1117,7 +1173,9 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 			case strings.HasSuffix(topic, "/time"):
 				handleTimeMQTTMessage(logger, topic, payload)
 			case strings.HasSuffix(topic, "/lcd/request"):
-				handleRequestMQTTMessage(logger, cfg, topic, payload)
+				if cfg.LCDRequestResponseEnabled {
+					handleRequestMQTTMessage(logger, cfg, topic, payload)
+				}
 			default:
 				logger.Printf("Ignoring MQTT message on unexpected topic: %s", topic)
 			}
@@ -1166,7 +1224,11 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 func mqttSubscribeTopics(cfg *Config) []string {
 	seen := make(map[string]struct{})
 	var out []string
-	for _, t := range []string{cfg.MQTTSubscribeTopic, cfg.MQTTSubscribeHealthTopic, cfg.MQTTSubscribeTimeTopic, cfg.MQTTSubscribeRequestTopic} {
+	topics := []string{cfg.MQTTSubscribeTopic, cfg.MQTTSubscribeHealthTopic, cfg.MQTTSubscribeTimeTopic}
+	if cfg.LCDRequestResponseEnabled {
+		topics = append(topics, cfg.MQTTSubscribeRequestTopic)
+	}
+	for _, t := range topics {
 		t = strings.TrimSpace(t)
 		if t == "" {
 			continue
@@ -1355,9 +1417,9 @@ func handleTimeMQTTMessage(logger *log.Logger, topic, payload string) {
 			ev.Eid = n
 		}
 	}
-	if v, ok := raw["heart"]; ok {
+	if v, ok := raw["heat"]; ok {
 		if n, ok := intFromJSONAny(v); ok {
-			ev.Heart = n
+			ev.Heat = n
 		}
 	}
 
@@ -1395,7 +1457,7 @@ func handleRequestMQTTMessage(logger *log.Logger, cfg *Config, topic, payload st
 		"event_label":  prof.EventLabel,
 		"eid":          prof.Eid,
 		"mid":          prof.Mid,
-		"heart":        prof.Heart,
+		"heat":         prof.Heat,
 	}
 	respBytes, err := json.Marshal(out)
 	if err != nil {

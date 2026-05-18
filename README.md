@@ -1,160 +1,252 @@
-## Go backend for ESP32 BLE provisioning and stopwatch
+## Stopwatch Go Backend + Firmware Contract
 
-This Go application mirrors the main functionality of the FastAPI backend in `app/backend`, and adds MQTT-driven stopwatch monitoring plus a small web dashboard.
+This repository contains the Go backend (`main.go`) and web dashboard (`web/index.html`) that integrate with stopwatch firmware over MQTT.
 
-### Quick feature list
-
-- **`GET /health`**: health check (`{"status":"ok"}`).
-- **`GET /api/config`**: effective runtime configuration (including MQTT topic names).
-- **`GET /api/devices`**: BLE scan for ESP32 devices (mock BLE by default).
-- **`POST /api/devices/{device_id}/wifi`**: provision WiFi over BLE for one device.
-- **`POST /api/devices/wifi/batch`**: provision WiFi for multiple devices in one request (same SSID/credentials).
-- **`GET /api/mqtt/stream`**: Server-Sent Events (SSE) stream for the dashboard (stopwatch, heartbeat, server ticks, device timing).
-- **`POST /api/mqtt/devices/{device_id}/{command}`**: publish `start`, `stop`, or `reset` to MQTT (`stopwatch/{device_id}/cmd` by default) and run or stop the server-side stopwatch as described below.
-
-The JSON shapes for `DeviceSummary`, `WifiConfig`, `WifiProvisionResult`, and `HealthStatus` are compatible with the FastAPI models.
-
-### Web dashboard
-
-Static UI is served at `/` and `/index.html` from `web/index.html`. It connects to **`GET /api/mqtt/stream`** and shows one card per `device_id`: live stopwatch, MQTT start/stop/reset, optional manual device entry, heartbeat fields, and device-reported timing when present.
+This README is aligned to the firmware protocol in `stopwatch-espidf/Firmware/Readme.md` and documents the expected MQTT contract, API endpoints, and runtime configuration.
 
 ---
 
-## Frontend REST API reference
+## Network Setup
+
+Current firmware ships with fixed network credentials:
+
+| Parameter | Value |
+| --- | --- |
+| WiFi SSID | `SwimBrain` |
+| WiFi Password | `swimtime2026` |
+| MQTT Broker IP | `192.168.4.1` |
+| MQTT Broker Port | `1883` |
+| Auto-reconnect | Enabled |
+
+---
+
+## Device Identity
+
+Each watch uses its WiFi MAC address as its permanent identity.
+
+- MQTT client ID is the device MAC.
+- MAC is used in topic paths (for example, `stopwatch/AABBCCDDEEFF/time`).
+- Lane/watch assignment is not baked into firmware; the backend/brain pairs devices dynamically.
+
+This allows identical firmware across all watches and quick replacement of failed units.
+
+---
+
+## MQTT Contract
+
+### 1) Time payload (watch -> brain)
+
+- **Topic:** `stopwatch/{mac}/time`
+- **QoS:** 1
+- **When:** every button press (split or finish)
+
+Example payload:
+
+```json
+{
+  "time": 62150,
+  "type": 1,
+  "eid": 7,
+  "heat": 1
+}
+```
+
+Fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `time` | string or number | Milliseconds since start |
+| `type` | int | `0` = split, `1` = finish |
+| `eid` | int | Event ID from race state push |
+| `heat` | int | Heat from race state push |
+
+### 2) Heartbeat payload (watch -> brain)
+
+- **Topic:** `stopwatch/{mac}/health`
+- **QoS:** 0
+
+Example payload:
+
+```json
+{
+  "bat": 87,
+  "rssi": -42,
+  "status": "idle"
+}
+```
+
+Fields:
+
+| Field | Type | Values |
+| --- | --- | --- |
+| `bat` | int | `0-100` |
+| `rssi` | int | negative dBm |
+| `status` | string | `idle`, `timing`, `error` |
+
+### 3) Commands (brain -> watch)
+
+- **Topic:** `stopwatch/{mac}/cmd`
+- **QoS:** 1
+
+Supported command payloads:
+
+- `"start"`
+- `"stop"`
+- `"reset"`
+- OTA command payload (see OTA section below)
+
+### 4) Race state push (brain -> all watches)
+
+- **Topic:** `brain/race/state`
+- **QoS:** 1
+
+Example payload:
+
+```json
+{
+  "eid": 12,
+  "name": "100 Free",
+  "heat": 2,
+  "action": "next_heat"
+}
+```
+
+### 5) Device config push (brain -> one watch)
+
+- **Topic:** `stopwatch/{mac}/config`
+- **QoS:** 1
+
+Example payload:
+
+```json
+{
+  "lane": 3,
+  "watch": 1,
+  "role": 0
+}
+```
+
+---
+
+## Complete Topic Map
+
+```text
+WATCH -> BRAIN
+stopwatch/{mac}/time      (QoS 1)  split/finish time events
+stopwatch/{mac}/health    (QoS 0)  heartbeat
+
+BRAIN -> WATCH
+stopwatch/{mac}/cmd       (QoS 1)  start/stop/reset/ota
+stopwatch/{mac}/config    (QoS 1)  lane/watch/role assignment
+brain/race/state          (QoS 1)  event/heat broadcast
+```
+
+---
+
+## OTA Firmware Update
+
+OTA is accepted on `stopwatch/{mac}/cmd`.
+
+Supported formats:
+
+1. JSON (recommended):
+
+```json
+{
+  "cmd": "ota",
+  "url": "http://192.168.4.1:8080/firmware.bin"
+}
+```
+
+2. Plain text:
+
+- `ota:http://192.168.4.1:8080/firmware.bin`
+- `ota http://192.168.4.1:8080/firmware.bin`
+
+Notes:
+
+- Current implementation supports `http://` firmware URLs.
+- While OTA is in progress, additional OTA requests are rejected.
+- On success, firmware switches partition and reboots.
+
+---
+
+## Backend API Reference
 
 Base URL (default): `http://localhost:8000`
 
-### 1) Health and app config
+### Health and config
 
-- **`GET /health`** → `200 OK`, `{"status":"ok"}`.
+- `GET /health` -> `{"status":"ok"}`
+- `GET /api/config` -> effective runtime config (MQTT topics, port, flags)
 
-- **`GET /api/config`** → `200 OK`, JSON including for example:
-  - `app_name`, `port`, `mock_ble`
-  - `mqtt_enabled`, `mqtt_broker_host`, `mqtt_broker_port`
-  - `mqtt_publish_topic`, `mqtt_subscribe_topic`, `mqtt_subscribe_health_topic`, `mqtt_subscribe_time_topic`
-  - `mqtt_username` (password is never returned)
+### BLE discovery and WiFi provisioning
 
-### 2) BLE device discovery and WiFi provisioning
+- `GET /api/devices`
+- `POST /api/devices/{device_id}/wifi`
+- `POST /api/devices/wifi/batch`
 
-- **`GET /api/devices`**  
-  - `200 OK`: JSON array of `{ "id", "name"?, "rssi"? }`.
+### MQTT command endpoint
 
-- **`POST /api/devices/{device_id}/wifi`**  
-  - Body: `{"ssid":"...","password":"..."}` (or `"pass"` instead of `password"`).  
-  - `200 OK`: `{"success":bool,"message":"..."}` (e.g. IP or status from firmware).
+- `POST /api/mqtt/devices/{device_id}/{command}`
+- `command` = `start | stop | reset`
+- Publishes to configured `MQTT_PUBLISH_TOPIC` (default `stopwatch/{device_id}/cmd`)
 
-- **`POST /api/devices/wifi/batch`**  
-  - Body: `{"device_ids":["id1","id2"],"ssid":"...","password":"..."}`.  
-  - `200 OK`: `total`, `success`, `failed`, `results[]` per device.
+### SSE stream endpoint
 
-### 3) MQTT commands and server-side stopwatch
+- `GET /api/mqtt/stream`
+- Event types:
+  - `ready`
+  - `stopwatch`
+  - `heartbeat`
+  - `server_tick`
+  - `timing`
 
-- **`POST /api/mqtt/devices/{device_id}/{command}`**  
-  - `command`: `start` | `stop` | `reset`.  
-  - Publishes the command string to the configured MQTT publish topic (default `stopwatch/{device_id}/cmd`).  
-  - **Start**: after a successful publish, the server starts a per-device stopwatch that emits **`server_tick`** SSE events (about every 50 ms). The displayed time **resumes from the last stopped value** for that `device_id` (not from zero), unless you use **reset** (see below).  
-  - **Stop**: stops the server stopwatch and **stores** the current elapsed time for the next **start**.  
-  - **Reset**: stops the server stopwatch and **clears** the stored elapsed time so the **next** start begins at `00:00:00.00`.  
-  - `503` if MQTT publish fails (e.g. broker disconnected).
-
-### 4) SSE: `GET /api/mqtt/stream`
-
-- Headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`.
-- **`event: ready`** — `data: ok` when the connection is open.
-- **`event: stopwatch`** — JSON from topic `stopwatch/{device_id}/data`:
-  - `device_id`, `topic`, `received_at`
-  - `data`: clock string `HH:MM:SS.hh` when the payload uses legacy `data`, **or** derived from numeric/string **`time`** (milliseconds).
-  - `time_ms`: present when the JSON payload includes **`time`** (number or numeric string, in milliseconds).
-  - `status`: optional (`start` / `stop` / `reset`).
-  - While the **server** stopwatch is running for a device, **`/data` updates for that device are not forwarded** so the UI follows **`server_tick`** only.
-- **`event: heartbeat`** — JSON from `stopwatch/{device_id}/health` (battery, RSSI, status, full payload map, etc.).
-- **`event: server_tick`** — JSON while the server stopwatch is running:
-  - `device_id`, `display`, `elapsed_ms`, `received_at`.
-- **`event: timing`** — JSON from `stopwatch/{device_id}/time` (device-reported result after stop/reset), e.g.:
-  - `time_ms`, `display`, `id`, `type`, `mid`, `eid`, `heat`, `payload`, `topic`, `received_at`.  
-  - String fields like `"time":"3453"` are parsed as milliseconds.  
-  - On receipt, the server updates the **resume** value for the next **start** to match the device.
-
-Use `EventSource('/api/mqtt/stream')` and listen for the event names above.
+The dashboard at `/` consumes this stream and renders per-device stopwatch cards.
 
 ---
 
-### Prerequisites
+## Configuration
 
-- Go 1.22 or newer.
-- Optional: a `.env` file in the project directory to override defaults.
-
-### Configuration
-
-Environment variables (and optional `.env`):
+Optional `.env` values:
 
 | Variable | Default | Notes |
-|----------|---------|--------|
-| `APP_NAME` | `ESP32 Backend (Go)` | |
-| `DEBUG` | `false` | |
-| `PORT` | `8000` | HTTP listen port |
+| --- | --- | --- |
+| `APP_NAME` | `ESP32 Backend (Go)` | app label |
+| `DEBUG` | `false` | debug mode |
+| `PORT` | `8000` | HTTP port |
 | `BLE_NAME_PREFIX` | `ESP-Setup-` | BLE name filter |
-| `MOCK_BLE` | `true` | Mock BLE devices and WiFi provisioning |
-| `WIFI_SERVICE_UUID` | (see `main.go`) | WiFi provisioning service |
-| `WIFI_CONFIG_CHAR_UUID` | (see `main.go`) | WiFi config characteristic |
-| `WIFI_STATUS_CHAR_UUID` | (see `main.go`) | Status / indication characteristic |
-| `MQTT_ENABLED` | `true` | |
-| `MQTT_BROKER_HOST` | `localhost` | |
-| `MQTT_BROKER_PORT` | `1883` | |
-| `MQTT_PUBLISH_TOPIC` | `stopwatch/{device_id}/cmd` | `{device_id}` placeholder supported |
-| `MQTT_SUBSCRIBE_TOPIC` | `stopwatch/+/data` | Live stopwatch JSON |
-| `MQTT_SUBSCRIBE_HEALTH_TOPIC` | `stopwatch/+/health` | Device heartbeat |
-| `MQTT_SUBSCRIBE_TIME_TOPIC` | `stopwatch/+/time` | Final timing after stop/reset |
-| `MQTT_USERNAME` | `""` | MQTT auth (optional) |
-| `MQTT_PASSWORD` | `""` | MQTT auth (optional) |
-| `MQTT_CLIENT_ID` | auto | Empty → random client id |
-| `MQTT_CONNECT_TIMEOUT_SEC` | `5` | Initial broker connect wait |
+| `MOCK_BLE` | `true` | mock BLE mode |
+| `WIFI_SERVICE_UUID` | from `main.go` | BLE service UUID |
+| `WIFI_CONFIG_CHAR_UUID` | from `main.go` | BLE write char UUID |
+| `WIFI_STATUS_CHAR_UUID` | from `main.go` | BLE status char UUID |
+| `MQTT_ENABLED` | `true` | MQTT toggle |
+| `MQTT_BROKER_HOST` | `localhost` | broker host |
+| `MQTT_BROKER_PORT` | `1883` | broker port |
+| `MQTT_PUBLISH_TOPIC` | `stopwatch/{device_id}/cmd` | supports `{device_id}` |
+| `MQTT_SUBSCRIBE_TOPIC` | `stopwatch/+/data` | live stopwatch feed |
+| `MQTT_SUBSCRIBE_HEALTH_TOPIC` | `stopwatch/+/health` | heartbeat feed |
+| `MQTT_SUBSCRIBE_TIME_TOPIC` | `stopwatch/+/time` | time result feed |
+| `MQTT_USERNAME` | `""` | optional auth |
+| `MQTT_PASSWORD` | `""` | optional auth |
+| `MQTT_CLIENT_ID` | auto | random when empty |
+| `MQTT_CONNECT_TIMEOUT_SEC` | `5` | connect timeout |
 
-With `MOCK_BLE=true` (default), you get fake BLE devices and simulated WiFi provisioning without hardware.
+---
 
-### Running the server
-
-From this directory (`stopwatch-golang`):
+## Run Locally
 
 ```bash
 go mod tidy
 go run ./...
 ```
 
-The server listens on `http://localhost:8000` by default (or `PORT` from the environment / `.env`).
+Default URL: `http://localhost:8000`
 
-#### Example HTTP requests
+Quick checks:
 
 ```bash
 curl http://localhost:8000/health
 curl http://localhost:8000/api/config
 curl http://localhost:8000/api/devices
 ```
-
-```bash
-curl -X POST "http://localhost:8000/api/devices/FAKE:01/wifi" \
-  -H "Content-Type: application/json" \
-  -d '{"ssid":"MyWifi","password":"secret"}'
-```
-
-```bash
-curl -X POST "http://localhost:8000/api/mqtt/devices/FAKE:01/start"
-```
-
-In real BLE mode, replace `FAKE:01` with the `id` from `GET /api/devices`.
-
-### Real BLE implementation
-
-`main.go` defines a `BLEService` interface and provides:
-
-- **`mockBLEService`**: matches Python `MOCK_BLE` behavior.
-- **`realBLEService`**: discovers devices by `BLE_NAME_PREFIX`, connects, writes WiFi JSON `{"ssid","pass"}` to the config characteristic, and reads status/indications.
-
-To use real BLE:
-
-```bash
-set MOCK_BLE=false
-go run ./...
-```
-
-(On Linux/macOS use `export MOCK_BLE=false`.)

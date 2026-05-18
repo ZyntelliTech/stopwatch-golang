@@ -347,6 +347,11 @@
           </select>
           <button type="button" data-role="configBtn">Send config</button>
         </div>
+        <div class="configRow">
+          <label>OTA URL</label>
+          <input type="text" data-role="otaUrlInput" placeholder="http://192.168.4.1:8080/firmware.bin" style="min-width: 280px" />
+          <button type="button" data-role="otaBtn">Send OTA</button>
+        </div>
       `;
 
       const refs = {
@@ -380,6 +385,8 @@
         watchInput: root.querySelector('[data-role="watchInput"]'),
         roleInput: root.querySelector('[data-role="roleInput"]'),
         configBtn: root.querySelector('[data-role="configBtn"]'),
+        otaUrlInput: root.querySelector('[data-role="otaUrlInput"]'),
+        otaBtn: root.querySelector('[data-role="otaBtn"]'),
         removeBtn: root.querySelector('[data-role="removeBtn"]'),
       };
 
@@ -388,6 +395,7 @@
       refs.stopBtn.addEventListener("click", () => sendCommand(refs, "stop"));
       refs.resetBtn.addEventListener("click", () => sendCommand(refs, "reset"));
       refs.configBtn.addEventListener("click", () => sendDeviceConfig(refs));
+      refs.otaBtn.addEventListener("click", () => sendOTACommand(refs));
 
       widgetsEl.appendChild(root);
       widgetsByDeviceId.set(deviceId, refs);
@@ -438,6 +446,7 @@
       refs.stopBtn.disabled = disabled;
       refs.resetBtn.disabled = disabled;
       refs.configBtn.disabled = disabled;
+      refs.otaBtn.disabled = disabled;
     }
 
     /**
@@ -773,6 +782,37 @@
         refs.actionStatusEl.textContent = "Config sent";
       } catch (err) {
         refs.actionStatusEl.textContent = "Config failed: network error";
+      } finally {
+        setWidgetButtonsDisabled(refs, false);
+      }
+    }
+
+    async function sendOTACommand(refs) {
+      const deviceId = refs.deviceId;
+      const url = (refs.otaUrlInput.value || "").trim();
+      if (!url) {
+        refs.actionStatusEl.textContent = "OTA failed: URL is required";
+        return;
+      }
+      setWidgetButtonsDisabled(refs, true);
+      refs.actionStatusEl.textContent = "Sending OTA...";
+      try {
+        const res = await fetch(
+          `/api/mqtt/devices/${encodeURIComponent(deviceId)}/ota`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url }),
+          }
+        );
+        if (!res.ok) {
+          const text = await res.text();
+          refs.actionStatusEl.textContent = `OTA failed: ${text || res.status}`;
+          return;
+        }
+        refs.actionStatusEl.textContent = "OTA command sent";
+      } catch (err) {
+        refs.actionStatusEl.textContent = "OTA failed: network error";
       } finally {
         setWidgetButtonsDisabled(refs, false);
       }

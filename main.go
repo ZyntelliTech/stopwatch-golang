@@ -134,6 +134,8 @@ type Config struct {
 	WiFiServiceUUID string
 	WiFiConfigChar  string
 	WiFiStatusChar  string
+	// OTAStaticDir is served at /ota/ for firmware binary hosting.
+	OTAStaticDir string
 
 	// MQTT broker configuration (mirrors Python backend defaults where possible).
 	MQTTEnabled    bool
@@ -580,6 +582,13 @@ func main() {
 		writeJSON(w, http.StatusOK, configForDisplay(cfg))
 	})
 
+	// Serve firmware files from local directory at /ota/*
+	// Example URL: http://<backend-ip>:8000/ota/firmware.bin
+	if dir := strings.TrimSpace(cfg.OTAStaticDir); dir != "" {
+		logger.Printf("Serving OTA static files from %s at /ota/", dir)
+		mux.Handle("/ota/", http.StripPrefix("/ota/", http.FileServer(http.Dir(dir))))
+	}
+
 	// GET /api/devices
 	mux.HandleFunc("/api/devices", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -888,7 +897,7 @@ func main() {
 
 	// POST /api/mqtt/devices/{device_id}/{command}
 	// Publishes command payload to stopwatch/{device_id}/cmd (template from MQTT_PUBLISH_TOPIC).
-	// Supported commands: start, stop, reset.
+	// Supported commands: start, stop, reset, ota.
 	// POST /api/mqtt/devices/{device_id}/config publishes {"lane","watch","role"} to stopwatch/{device_id}/config.
 	mux.HandleFunc("/api/mqtt/devices/", func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/mqtt/devices/") {
@@ -919,7 +928,7 @@ func main() {
 				return
 			}
 		}
-		if !(strings.HasSuffix(r.URL.Path, "/start") || strings.HasSuffix(r.URL.Path, "/stop") || strings.HasSuffix(r.URL.Path, "/reset") || strings.HasSuffix(r.URL.Path, "/config")) {
+		if !(strings.HasSuffix(r.URL.Path, "/start") || strings.HasSuffix(r.URL.Path, "/stop") || strings.HasSuffix(r.URL.Path, "/reset") || strings.HasSuffix(r.URL.Path, "/ota") || strings.HasSuffix(r.URL.Path, "/config")) {
 			http.NotFound(w, r)
 			return
 		}
@@ -987,6 +996,47 @@ func main() {
 			}
 			if err := publishMQTTMessage(topic, payload); err != nil {
 				log.Printf("mqtt config publish failed (topic=%s): %v", topic, err)
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success":   true,
+				"device_id": deviceID,
+				"topic":     topic,
+				"message":   payload,
+			})
+			return
+		}
+
+		if command == "ota" {
+			var body struct {
+				URL string `json:"url"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil {
+				http.Error(w, "invalid JSON body", http.StatusBadRequest)
+				return
+			}
+			url := strings.TrimSpace(body.URL)
+			if url == "" {
+				http.Error(w, "url is required", http.StatusBadRequest)
+				return
+			}
+			payloadBytes, err := json.Marshal(map[string]any{
+				"cmd": "ota",
+				"url": url,
+			})
+			if err != nil {
+				http.Error(w, "failed to build ota payload", http.StatusInternalServerError)
+				return
+			}
+			payload := string(payloadBytes)
+			topic := buildMQTTTopic(cfg.MQTTPublishTopic, deviceID, "stopwatch/{device_id}/cmd")
+			if topic == "" {
+				http.Error(w, "invalid device_id for mqtt topic", http.StatusBadRequest)
+				return
+			}
+			if err := publishMQTTMessage(topic, payload); err != nil {
+				log.Printf("mqtt ota publish failed (topic=%s): %v", topic, err)
 				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
@@ -1083,6 +1133,7 @@ func loadConfig() (*Config, error) {
 		WiFiServiceUUID: getEnv("WIFI_SERVICE_UUID", "12345678-1234-5678-1234-56789abcdef0"),
 		WiFiConfigChar:  getEnv("WIFI_CONFIG_CHAR_UUID", "12345678-1234-5678-1234-56789abcdef1"),
 		WiFiStatusChar:  getEnv("WIFI_STATUS_CHAR_UUID", "12345678-1234-5678-1234-56789abcdef2"),
+		OTAStaticDir:    getEnv("OTA_STATIC_DIR", "ota"),
 
 		MQTTEnabled:    getEnvAsBool("MQTT_ENABLED", true),
 		MQTTBrokerHost: getEnv("MQTT_BROKER_HOST", "localhost"),
@@ -1117,6 +1168,7 @@ func configForDisplay(cfg *Config) map[string]any {
 		"wifi_service_uuid":     cfg.WiFiServiceUUID,
 		"wifi_config_char_uuid": cfg.WiFiConfigChar,
 		"wifi_status_char_uuid": cfg.WiFiStatusChar,
+		"ota_static_dir":        cfg.OTAStaticDir,
 
 		"mqtt_enabled":                 cfg.MQTTEnabled,
 		"mqtt_broker_host":             cfg.MQTTBrokerHost,

@@ -85,15 +85,74 @@ Fields:
 
 ### 3) Commands (brain -> watch)
 
-- **Topic:** `stopwatch/{mac}/cmd`
+- **Topic:** `stopwatch/{mac}/cmd` (example: `stopwatch/AABBCCDDEEFF/cmd`)
 - **QoS:** 1
 
-Supported command payloads:
+**Start** (default JSON from the Go backend):
 
-- `"start"`
-- `"stop"`
-- `"reset"`
-- OTA command payload (see OTA section below)
+```json
+{
+  "id": "AABBCCDDEEFF",
+  "cmd": "start"
+}
+```
+
+**Stop:**
+
+```json
+{
+  "id": "AABBCCDDEEFF",
+  "cmd": "stop"
+}
+```
+
+**Reset:**
+
+```json
+{
+  "id": "AABBCCDDEEFF",
+  "cmd": "reset"
+}
+```
+
+**OTA** (JSON):
+
+```json
+{
+  "cmd": "ota",
+  "url": "http://192.168.4.1:8080/firmware.bin"
+}
+```
+
+Timing command fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | string | Device MAC (same value as in the topic path) |
+| `cmd` | string | `start`, `stop`, or `reset` |
+
+OTA fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `cmd` | string | Must be `ota` |
+| `url` | string | `http://` firmware URL |
+
+Plain-text timing commands (when `MQTT_CMD_PAYLOAD_PLAIN=true`):
+
+```text
+start
+```
+
+```text
+stop
+```
+
+```text
+reset
+```
+
+Plain-text OTA alternatives are listed in the OTA section below.
 
 ### 4) Race state push (brain -> all watches)
 
@@ -224,6 +283,7 @@ Optional `.env` values:
 | `MQTT_BROKER_HOST` | `localhost` | broker host |
 | `MQTT_BROKER_PORT` | `1883` | broker port |
 | `MQTT_PUBLISH_TOPIC` | `stopwatch/{device_id}/cmd` | supports `{device_id}` |
+| `MQTT_CMD_PAYLOAD_PLAIN` | `false` | if `true`, publish `start`/`stop`/`reset` as plain text instead of JSON |
 | `MQTT_SUBSCRIBE_TOPIC` | `stopwatch/+/data` | live stopwatch feed |
 | `MQTT_SUBSCRIBE_HEALTH_TOPIC` | `stopwatch/+/health` | heartbeat feed |
 | `MQTT_SUBSCRIBE_TIME_TOPIC` | `stopwatch/+/time` | time result feed |

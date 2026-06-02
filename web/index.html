@@ -592,8 +592,7 @@
         if (!deviceId) {
           return;
         }
-        // Only show devices that are already known by heartbeat.
-        const refs = getExistingWidget(deviceId);
+        const refs = getOrCreateWidget(deviceId);
         if (!refs) {
           return;
         }
@@ -646,8 +645,7 @@
         if (!deviceId) {
           return;
         }
-        // Only show devices that are already known by heartbeat.
-        const refs = getExistingWidget(deviceId);
+        const refs = getOrCreateWidget(deviceId);
         if (!refs) {
           return;
         }

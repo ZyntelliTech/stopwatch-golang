@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -143,6 +146,12 @@ type Config struct {
 	MQTTBrokerPort int
 	MQTTUsername   string
 	MQTTPassword   string
+	// MQTTTLSCAFile enables MQTTS (ssl://) using the PEM CA at this path (e.g. /etc/mosquitto/certs/ca.crt).
+	MQTTTLSCAFile string
+	// MQTTTLSServerName is the TLS SNI / certificate hostname (default: MQTT_BROKER_HOST).
+	MQTTTLSServerName string
+	// MQTTTLSAllowLegacyCN accepts Mosquitto certs that only set Common Name (no SAN); still verifies the CA chain.
+	MQTTTLSAllowLegacyCN bool
 	// MQTT publish/subscribe topics.
 	// These are not used yet by HTTP endpoints, but they are exposed in /api/config
 	// so the frontend can confirm they are loaded.
@@ -551,9 +560,8 @@ func main() {
 		logger.Fatalf("failed to load config: %v", err)
 	}
 
-	// Step 1: connect to MQTT as soon as the server starts up.
-	// We do not block the HTTP server on MQTT connection; failures are logged.
-	mqttClient = connectMQTT(logger, cfg)
+	// Step 1: connect to MQTT as soon as the server starts up (retries in background if needed).
+	startMQTTClient(logger, cfg)
 
 	var bleSvc BLEService
 	if cfg.MockBLE {
@@ -1140,6 +1148,9 @@ func loadConfig() (*Config, error) {
 		MQTTBrokerPort: getEnvAsInt("MQTT_BROKER_PORT", 1883),
 		MQTTUsername:   getEnv("MQTT_USERNAME", ""),
 		MQTTPassword:   getEnv("MQTT_PASSWORD", ""),
+		MQTTTLSCAFile:         getEnv("MQTT_TLS_CA_FILE", ""),
+		MQTTTLSServerName:     getEnv("MQTT_TLS_SERVER_NAME", ""),
+		MQTTTLSAllowLegacyCN:  getEnvAsBool("MQTT_TLS_ALLOW_LEGACY_CN", true),
 		// Defaults align with firmware's `wifi_mqtt_topic_device(..., "cmd"/"data")`:
 		// publish -> stopwatch/<device_id>/cmd
 		// subscribe -> stopwatch/+/data
@@ -1173,6 +1184,11 @@ func configForDisplay(cfg *Config) map[string]any {
 		"mqtt_enabled":                 cfg.MQTTEnabled,
 		"mqtt_broker_host":             cfg.MQTTBrokerHost,
 		"mqtt_broker_port":             cfg.MQTTBrokerPort,
+		"mqtt_tls":                     mqttUseTLS(cfg),
+		"mqtt_tls_ca_file":             cfg.MQTTTLSCAFile,
+		"mqtt_tls_server_name":         mqttTLSServerName(cfg),
+		"mqtt_tls_allow_legacy_cn":       cfg.MQTTTLSAllowLegacyCN,
+		"mqtt_connected":               mqttClientConnected(),
 		"mqtt_publish_topic":           cfg.MQTTPublishTopic,
 		"mqtt_subscribe_topic":         cfg.MQTTSubscribeTopic,
 		"mqtt_subscribe_health_topic":  cfg.MQTTSubscribeHealthTopic,
@@ -1188,13 +1204,138 @@ func configForDisplay(cfg *Config) map[string]any {
 	}
 }
 
+func mqttUseTLS(cfg *Config) bool {
+	return strings.TrimSpace(cfg.MQTTTLSCAFile) != ""
+}
+
+func mqttBrokerURL(cfg *Config) string {
+	scheme := "tcp"
+	if mqttUseTLS(cfg) {
+		scheme = "ssl"
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, cfg.MQTTBrokerHost, cfg.MQTTBrokerPort)
+}
+
+func mqttTLSServerName(cfg *Config) string {
+	if s := strings.TrimSpace(cfg.MQTTTLSServerName); s != "" {
+		return s
+	}
+	host := strings.TrimSpace(cfg.MQTTBrokerHost)
+	if host == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
+func buildMQTTTLSConfig(caFile, serverName string, allowLegacyCN bool) (*tls.Config, error) {
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read MQTT TLS CA file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("MQTT TLS CA file contains no valid certificates: %s", caFile)
+	}
+
+	tlsCfg := &tls.Config{RootCAs: pool}
+	if serverName != "" {
+		tlsCfg.ServerName = serverName
+	}
+
+	if allowLegacyCN && serverName != "" {
+		// Go 1.15+ rejects CN-only leaf certs during default hostname verification.
+		// Mosquitto's stock cert scripts often omit SAN; verify the CA chain ourselves and match CN.
+		tlsCfg.InsecureSkipVerify = true
+		tlsCfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			return verifyMQTTPeerCert(pool, rawCerts, serverName)
+		}
+	}
+
+	return tlsCfg, nil
+}
+
+func verifyMQTTPeerCert(pool *x509.CertPool, rawCerts [][]byte, serverName string) error {
+	if len(rawCerts) == 0 {
+		return fmt.Errorf("mqtt tls: no peer certificate")
+	}
+	certs := make([]*x509.Certificate, 0, len(rawCerts))
+	for _, raw := range rawCerts {
+		cert, err := x509.ParseCertificate(raw)
+		if err != nil {
+			return fmt.Errorf("mqtt tls: parse certificate: %w", err)
+		}
+		certs = append(certs, cert)
+	}
+	leaf := certs[0]
+
+	opts := x509.VerifyOptions{Roots: pool}
+	if len(certs) > 1 {
+		opts.Intermediates = x509.NewCertPool()
+		for _, cert := range certs[1:] {
+			opts.Intermediates.AddCert(cert)
+		}
+	}
+	if _, err := leaf.Verify(opts); err != nil {
+		return fmt.Errorf("mqtt tls: verify chain: %w", err)
+	}
+
+	if len(leaf.DNSNames) == 0 && len(leaf.IPAddresses) == 0 {
+		if !strings.EqualFold(strings.TrimSpace(leaf.Subject.CommonName), serverName) {
+			return fmt.Errorf("mqtt tls: certificate CN %q does not match %q", leaf.Subject.CommonName, serverName)
+		}
+		return nil
+	}
+	if err := leaf.VerifyHostname(serverName); err != nil {
+		return fmt.Errorf("mqtt tls: hostname verify: %w", err)
+	}
+	return nil
+}
+
+func mqttClientConnected() bool {
+	return mqttClient != nil && mqttClient.IsConnected()
+}
+
+// startMQTTClient connects to the broker and keeps retrying until MQTT is disabled or the process exits.
+func startMQTTClient(logger *log.Logger, cfg *Config) {
+	if !cfg.MQTTEnabled {
+		logger.Printf("MQTT disabled (MQTT_ENABLED=false)")
+		return
+	}
+	go func() {
+		backoff := 3 * time.Second
+		for {
+			if mqttClientConnected() {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			client := connectMQTT(logger, cfg)
+			if client != nil && client.IsConnected() {
+				if mqttClient != nil && mqttClient != client {
+					mqttClient.Disconnect(250)
+				}
+				mqttClient = client
+				backoff = 3 * time.Second
+				continue
+			}
+			logger.Printf("MQTT not connected; retrying in %s", backoff)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff += 2 * time.Second
+			}
+		}
+	}()
+}
+
 func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 	if !cfg.MQTTEnabled {
 		logger.Printf("MQTT disabled (MQTT_ENABLED=false)")
 		return nil
 	}
 
-	brokerURL := fmt.Sprintf("tcp://%s:%d", cfg.MQTTBrokerHost, cfg.MQTTBrokerPort)
+	brokerURL := mqttBrokerURL(cfg)
 
 	clientID := strings.TrimSpace(cfg.MQTTClientID)
 	if clientID == "" {
@@ -1207,6 +1348,21 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 		SetAutoReconnect(true).
 		SetConnectTimeout(time.Duration(cfg.MQTTConnectTimeoutSec) * time.Second)
 
+	if mqttUseTLS(cfg) {
+		sni := mqttTLSServerName(cfg)
+		tlsConfig, err := buildMQTTTLSConfig(cfg.MQTTTLSCAFile, sni, cfg.MQTTTLSAllowLegacyCN)
+		if err != nil {
+			logger.Printf("MQTT TLS config error: %v", err)
+			return nil
+		}
+		opts.SetTLSConfig(tlsConfig)
+		if cfg.MQTTTLSAllowLegacyCN {
+			logger.Printf("MQTT TLS enabled (CA: %s, server_name: %s, legacy_cn=true)", cfg.MQTTTLSCAFile, sni)
+		} else {
+			logger.Printf("MQTT TLS enabled (CA: %s, server_name: %s)", cfg.MQTTTLSCAFile, sni)
+		}
+	}
+
 	if strings.TrimSpace(cfg.MQTTUsername) != "" {
 		opts = opts.SetUsername(cfg.MQTTUsername).SetPassword(cfg.MQTTPassword)
 	}
@@ -1217,6 +1373,9 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 		onMessage := func(_ mqtt.Client, msg mqtt.Message) {
 			topic := msg.Topic()
 			payload := string(msg.Payload())
+			if cfg.Debug {
+				logger.Printf("MQTT recv topic=%s payload=%s", topic, payload)
+			}
 			switch {
 			case strings.HasSuffix(topic, "/data"):
 				handleStopwatchMQTTMessage(logger, topic, payload)
@@ -1238,7 +1397,7 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 			if subscribeTopic == "" {
 				continue
 			}
-			subToken := client.Subscribe(subscribeTopic, 0, onMessage)
+			subToken := client.Subscribe(subscribeTopic, 1, onMessage)
 			if !subToken.WaitTimeout(5 * time.Second) {
 				logger.Printf("MQTT subscribe timed out for topic %s", subscribeTopic)
 				continue
@@ -1257,20 +1416,25 @@ func connectMQTT(logger *log.Logger, cfg *Config) mqtt.Client {
 	c := mqtt.NewClient(opts)
 
 	logger.Printf("Connecting to MQTT broker %s", brokerURL)
-	token := c.Connect()
-
-	// Wait up to connect timeout for initial connection result.
 	timeout := time.Duration(cfg.MQTTConnectTimeoutSec) * time.Second
-	if !token.WaitTimeout(timeout) {
-		logger.Printf("MQTT connect timed out after %s", timeout)
-		return c
+	if timeout < time.Second {
+		timeout = 5 * time.Second
 	}
-	if err := token.Error(); err != nil {
-		logger.Printf("MQTT connect error: %v", err)
-		return c
+	const maxAttempts = 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		token := c.Connect()
+		if !token.WaitTimeout(timeout) {
+			logger.Printf("MQTT connect attempt %d/%d timed out after %s", attempt, maxAttempts, timeout)
+		} else if err := token.Error(); err != nil {
+			logger.Printf("MQTT connect attempt %d/%d error: %v", attempt, maxAttempts, err)
+		} else {
+			return c
+		}
+		if attempt < maxAttempts {
+			time.Sleep(2 * time.Second)
+		}
 	}
-
-	return c
+	return nil
 }
 
 func mqttSubscribeTopics(cfg *Config) []string {
@@ -1390,23 +1554,13 @@ func handleHeartbeatMQTTMessage(logger *log.Logger, topic, payload string) {
 		ev.ID = strings.TrimSpace(v)
 	}
 	if v, ok := raw["bat"]; ok {
-		switch n := v.(type) {
-		case float64:
-			ev.Battery = int(n)
-		case int:
+		if n, ok := intFromJSONAny(v); ok {
 			ev.Battery = n
-		case int64:
-			ev.Battery = int(n)
 		}
 	}
 	if v, ok := raw["rssi"]; ok {
-		switch n := v.(type) {
-		case float64:
-			ev.RSSI = int(n)
-		case int:
+		if n, ok := intFromJSONAny(v); ok {
 			ev.RSSI = n
-		case int64:
-			ev.RSSI = int(n)
 		}
 	}
 	if v, ok := raw["status"].(string); ok {
@@ -1473,9 +1627,13 @@ func handleTimeMQTTMessage(logger *log.Logger, topic, payload string) {
 		if n, ok := intFromJSONAny(v); ok {
 			ev.Heat = n
 		}
+	} else if v, ok := raw["heart"]; ok {
+		if n, ok := intFromJSONAny(v); ok {
+			ev.Heat = n
+		}
 	}
 
-	logger.Printf("MQTT time device=%s time_ms=%d display=%s", deviceID, timeMs, ev.Display)
+	logger.Printf("MQTT time device=%s time_ms=%d heat=%d eid=%d display=%s", deviceID, timeMs, ev.Heat, ev.Eid, ev.Display)
 	publishTimingEvent(ev)
 }
 
@@ -1826,7 +1984,7 @@ func parseDeviceIDFromTopic(topic, suffix string) (string, bool) {
 	if parts[0] != "stopwatch" || parts[2] != suffix {
 		return "", false
 	}
-	deviceID := strings.TrimSpace(parts[1])
+	deviceID := strings.ToLower(strings.TrimSpace(parts[1]))
 	if deviceID == "" {
 		return "", false
 	}
@@ -1842,7 +2000,7 @@ func parseDeviceIDFromLCDTopic(topic, suffix string) (string, bool) {
 	if parts[0] != "stopwatch" || parts[2] != "lcd" || parts[3] != suffix {
 		return "", false
 	}
-	deviceID := strings.TrimSpace(parts[1])
+	deviceID := strings.ToLower(strings.TrimSpace(parts[1]))
 	if deviceID == "" {
 		return "", false
 	}
